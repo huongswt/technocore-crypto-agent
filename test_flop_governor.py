@@ -76,3 +76,12 @@ def test_garbage_state_does_not_crash():
     r = g.check(st, "kibble", CAPS, DAY1)
     assert r["allowed"] and r["count"] == 3 and st[g.KEY]["alerted"] == ["a"]
     assert "kibble 3/1300" in g.summary_line(st, CAPS, DAY1)
+
+
+def test_headroom_is_read_only_and_never_negative():
+    st = {}
+    assert g.headroom(st, "lobby", CAPS, DAY1) == 20
+    for _ in range(25):
+        g.record(st, "lobby", DAY1)              # record không tự chặn -> có thể vượt trần
+    assert g.headroom(st, "lobby", CAPS, DAY1) == 0
+    assert st[g.KEY]["rooms"]["lobby"] == 25 and st[g.KEY]["alerted"] == []

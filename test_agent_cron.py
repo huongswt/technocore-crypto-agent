@@ -161,6 +161,16 @@ def test_guard_output_blocks_prompt_leak():
     assert ac.guard_output("the <<<UNTRUSTED_INPUT>>> marker") is None
 
 
+def test_guard_output_blocks_echoed_prompt_labels():
+    # câu thật từng lọt ra lobby: model chép nguyên nhãn viết hoa của prompt
+    assert ac.guard_output("In the provided LIVE MARKET DATA, I see BTC up 2%") is None
+    assert ac.guard_output("In regards to the provided UNTRUSTED text, no.") is None
+    assert ac.guard_output("LIVE MARKET DATA (00:50Z): BTC $80600") is None
+    # chữ thường là nội dung hợp lệ (vd job kibble về bảo mật) -> vẫn qua
+    ok = "Isolate untrusted input in a sandbox and use live market data feeds."
+    assert ac.guard_output(ok) == ok
+
+
 def test_guard_output_passes_clean_text():
     assert ac.guard_output("BTC is around $60k today") == "BTC is around $60k today"
     assert ac.guard_output("") is None
@@ -1703,6 +1713,34 @@ def test_proactive_engage_allows_non_denylisted(monkeypatch):
     # peer khac chao -> duoc chao (greeting khong can LLM)
     out = ac.proactive_engage({}, "did:key:z6MkPEERpeer", "gm everyone", 1000, [])
     assert out is not None and "gm" in out.lower()
+
+
+# --- Dự trữ trần phòng: chủ động không được ăn phần của telemetry/manifest/reply ----------
+def _lobby_used(monkeypatch, n):
+    import flop_governor as g
+    st = {}
+    for _ in range(n):
+        g.record(st, "lobby", ac.time.time())
+    monkeypatch.setattr(ac, "_post_gov_state", st)
+
+
+def test_proactive_budget_stops_before_reserve(monkeypatch):
+    monkeypatch.setattr(ac, "POST_GOVERNOR", True)
+    monkeypatch.setattr(ac, "PROACTIVE_RESERVE", 10)
+    _lobby_used(monkeypatch, 9)                  # lobby trần 20 -> còn 11 > 10
+    assert ac._proactive_budget_ok("lobby") is True
+    _lobby_used(monkeypatch, 10)                 # còn đúng 10 = dự trữ -> dừng chủ động
+    assert ac._proactive_budget_ok("lobby") is False
+
+
+def test_proactive_budget_reserve_zero_or_no_governor_is_unlimited(monkeypatch):
+    _lobby_used(monkeypatch, 20)
+    monkeypatch.setattr(ac, "POST_GOVERNOR", True)
+    monkeypatch.setattr(ac, "PROACTIVE_RESERVE", 0)
+    assert ac._proactive_budget_ok("lobby") is True
+    monkeypatch.setattr(ac, "PROACTIVE_RESERVE", 10)
+    monkeypatch.setattr(ac, "POST_GOVERNOR", False)
+    assert ac._proactive_budget_ok("lobby") is True
 
 
 # --- Goal/desc bien-the theo DID (chong copied-boilerplate giua fork) ---------------------

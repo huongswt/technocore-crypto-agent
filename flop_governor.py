@@ -76,6 +76,12 @@ def check(state: dict, room: str, caps: dict, now) -> dict:
     return {"allowed": False, "count": n, "cap": cap, "alert": alert}
 
 
+def headroom(state: dict, room: str, caps: dict, now) -> int:
+    """Số tin còn được đăng vào `room` hôm nay (>= 0). Chỉ đọc: không tăng đếm, không báo động."""
+    pc = _fresh(state, now)
+    return max(0, cap_for(caps, room) - int(pc["rooms"].get(room, 0)))
+
+
 def record(state: dict, room: str, now) -> int:
     """Ghi 1 tin đã đăng THÀNH CÔNG. Trả số tin của phòng hôm nay."""
     pc = _fresh(state, now)
