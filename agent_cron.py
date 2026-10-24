@@ -246,6 +246,10 @@ PEER_REPLY_WINDOW_H = _env_float("PEER_REPLY_WINDOW_HOURS", 1)  # cửa sổ đ�
 PEER_REPLY_MAX = int(_env_float("PEER_REPLY_MAX", 4))          # TRẦN reply cho 1 peer/cửa sổ -> CHẶN LOOP
 PROACTIVE_MAX_PER_RUN = int(_env_float("PROACTIVE_MAX_PER_RUN", 1))   # trần hành động chủ động/run
 PROACTIVE_COOLDOWN_H = _env_float("PROACTIVE_COOLDOWN_HOURS", 6)      # nghỉ giữa 2 lần chủ động giúp cùng 1 peer
+# Chừa N tin/phòng/ngày (flop_governor) cho telemetry/manifest/reply đích danh: hành động CHỦ
+# ĐỘNG chỉ được đăng khi phòng còn dư hơn N. Lobby đông bot -> lời chào "gm" từng đốt hết 20/20
+# trong giờ đầu ngày UTC, chặn telemetry/manifest suốt 23 giờ còn lại. 0 = tắt dự trữ.
+PROACTIVE_RESERVE = int(_env_float("PROACTIVE_RESERVE", 10))
 # Denylist DID cho CHỦ ĐỘNG: KHÔNG tự bắt chuyện với các DID này (điển hình = fork cùng
 # codebase/operator liên quan) -> tránh tạo cạnh reply trong "gia đình fork" mà radar anti-
 # sybil có thể gom thành cluster tự-trả-lời. MẶC ĐỊNH RỖNG để template fork-agnostic: fork
@@ -1224,6 +1228,15 @@ def _post_caps() -> dict:
     return flop_governor.parse_caps(os.environ.get("FLOP_POST_CAPS", ""))
 
 
+def _proactive_budget_ok(room) -> bool:
+    """Hành động CHỦ ĐỘNG chỉ được đăng khi `room` còn dư hơn PROACTIVE_RESERVE tin hôm nay —
+    phần dự trữ dành cho telemetry/manifest/reply đích danh (xem PROACTIVE_RESERVE)."""
+    if not POST_GOVERNOR or PROACTIVE_RESERVE <= 0:
+        return True
+    import flop_governor as _gov
+    return _gov.headroom(_post_gov_state, room, _post_caps(), time.time()) > PROACTIVE_RESERVE
+
+
 def post_message(private_key, did, text, room=ROOM) -> bool:
     if POST_GOVERNOR:
         import flop_governor as _gov
@@ -1892,6 +1905,9 @@ def isolate_for_llm(user_text: str) -> str:
     )
 
 
+_PROMPT_LABELS = ("UNTRUSTED", "LIVE MARKET DATA")
+
+
 def guard_output(text: str):
     """Lọc output LLM: chặn rò rỉ secret hoặc lộ system prompt/delimiter."""
     if not text:
@@ -1903,6 +1919,12 @@ def guard_output(text: str):
     low = text.lower()
     if "system prompt" in low or "untrusted_input" in low:
         print("[guard] output blocked: prompt/delimiter leak")
+        return None
+    # Nhãn VIẾT HOA của prompt ("UNTRUSTED", "LIVE MARKET DATA") bị model chép nguyên vào câu
+    # trả lời ("In the provided LIVE MARKET DATA, ...") -> lộ cấu trúc prompt ra phòng công khai.
+    # So khớp PHÂN BIỆT hoa/thường: câu trả lời hợp lệ về "untrusted input" (chữ thường) vẫn qua.
+    if any(label in text for label in _PROMPT_LABELS):
+        print("[guard] output blocked: prompt label echoed")
         return None
     return text
 
@@ -3692,7 +3714,8 @@ def _respond_room(private_key, did, room, messages, last_seq, state, now, my_nic
                             _peer_touch(state, frm, now)
                         time.sleep(0.3)
             elif (PROACTIVE and is_peer and caps["proactive"] < PROACTIVE_MAX_PER_RUN
-                  and _peer_count(state, frm, now, PEER_REPLY_WINDOW_H) < PEER_REPLY_MAX):
+                  and _peer_count(state, frm, now, PEER_REPLY_WINDOW_H) < PEER_REPLY_MAX
+                  and _proactive_budget_ok(room)):
                 # --- CHỦ ĐỘNG (không bị gọi) — chào peer mới / giúp hỏi crypto ---
                 msg = proactive_engage(state, frm, text, now, greeted)
                 # (#7) Chủ động cũng chặn trùng (vd chào/giúp lặp y hệt cùng 1 peer).
