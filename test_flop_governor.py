@@ -85,3 +85,15 @@ def test_headroom_is_read_only_and_never_negative():
         g.record(st, "lobby", DAY1)              # record không tự chặn -> có thể vượt trần
     assert g.headroom(st, "lobby", CAPS, DAY1) == 0
     assert st[g.KEY]["rooms"]["lobby"] == 25 and st[g.KEY]["alerted"] == []
+
+
+def test_is_capped_is_read_only_and_resets_next_day():
+    st = {}
+    for i in range(CAPS["lobby"] if "lobby" in CAPS else g.cap_for(CAPS, "lobby")):
+        _post(st, "lobby", DAY1 + i)
+    before = repr(st)
+    assert g.is_capped(st, "lobby", CAPS, DAY1 + 100) is True
+    assert repr(st) == before                                   # không đổi state, không tiêu cảnh báo
+    assert g.check(st, "lobby", CAPS, DAY1 + 101)["alert"]       # cảnh báo vẫn còn cho lần chặn thật
+    assert g.is_capped(st, "lobby", CAPS, DAY1 + 86400) is False # sang ngày UTC mới
+    assert g.is_capped({}, "flop", CAPS, DAY1) is False

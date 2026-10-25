@@ -30,6 +30,7 @@ Chạy thử offline (không key, không mạng):
 """
 
 import os
+import hashlib
 import json
 import time
 import calendar
@@ -152,7 +153,7 @@ def load_ledger(path: str = None) -> dict:
     """Đọc toàn bộ sổ cái (state rỗng nếu file chưa tồn tại hoặc hỏng cấu trúc)."""
     p = ledger_path(path)
     try:
-        with open(p, "r") as f:
+        with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
         return _empty_state()
@@ -169,7 +170,7 @@ def load_ledger(path: str = None) -> dict:
 def _save_ledger(state: dict, path: str = None) -> None:
     p = ledger_path(path)
     try:
-        with open(p, "w") as f:
+        with open(p, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[ledger] không lưu được {p}: {e}")
@@ -574,6 +575,48 @@ def spend(amount, memo, token: str = None, *, path: str = None,
     log(f"[SIMULATION] Spent {_fmt(amt)} MOCK_{token} for {memo}")
     return {**base, "outcome": "spent_simulated", "balance_after": new_bal,
             "signed": signed, "reason": "chi tiêu mô phỏng (không đụng chain)"}
+
+
+GATEWAY_REFS_KEEP = 100      # gateway trả tối đa ~20 biên nhận/lần -> 100 là dư
+
+
+def record_gateway_spend(amount, memo, ref: str, token: str = None, *, path: str = None,
+                         log=print) -> dict:
+    """Ghi sổ một lần chi ĐÃ XẢY RA ở gateway FLOP (api.flop.network trừ quota; `ref` = id
+    phản hồi làm bằng chứng). Khác spend(): agent không tự gửi giao dịch — gateway đã chi —
+    nên chỉ ghi nhận. CHỈ ở chế độ testnet: devnet/mô phỏng không bao giờ vào sổ thật.
+    Số dư kẹp ở 0 (quota gateway có thể không trùng số dư faucet trong sổ)."""
+    token = (token or default_token())
+    amt = _parse_amount(amount)
+    if ledger_mode() != "testnet":
+        return {"outcome": "skipped_simulation", "reason": "chỉ ghi sổ chi gateway khi TESTNET_ENABLED"}
+    if amt is None or amt <= 0 or not ref:
+        return {"outcome": "skipped_insufficient", "reason": f"thiếu số lượng/bằng chứng ({amount!r}, {ref!r})"}
+    state = load_ledger(path)
+    # Chống ghi TRÙNG ngay trong sổ (bền qua KV): danh sách "biên nhận đã ghi" của gateway nằm
+    # trong state.json (Actions cache) — cache mất thì lượt sau thấy lại tới 20 biên nhận cũ và
+    # ghi lần hai, cộng VĨNH VIỄN vào tổng chi (chỉ tăng). Giữ dấu băm của GATEWAY_REFS_KEEP ref.
+    h = hashlib.sha256(str(ref).encode("utf-8")).hexdigest()[:16]
+    refs = [x for x in (state.get("gateway_refs") or []) if isinstance(x, str)]
+    if h in refs:
+        return {"outcome": "duplicate", "reason": f"ref {str(ref)[:24]} đã ghi sổ trước đó"}
+    state["gateway_refs"] = (refs + [h])[-GATEWAY_REFS_KEEP:]
+    cur = _parse_amount(state["balances"].get(token, "0")) or Decimal(0)
+    new_bal = _fmt(max(Decimal(0), cur - amt))
+    state["balances"][token] = new_bal
+    state["entries"].append({
+        "kind": "spend", "token": token, "amount": _fmt(amt), "memo": memo, "mode": "testnet",
+        "balance_after": new_bal, "tx_hash": str(ref)[:80], "via": "gateway",
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
+    _accrue_unlock(state, token, amt)
+    _accrue_cumulative(state, token, amt)
+    _accrue_day(state, token, amt)
+    if is_session_spend(memo):
+        _accrue_session(state, token, amt)
+    _save_ledger(state, path)
+    log(f"[ledger] gateway spent {_fmt(amt)} {token} for {memo} (ref {str(ref)[:12]}…)")
+    return {"outcome": "spent_onchain", "amount": _fmt(amt), "balance_after": new_bal, "tx_hash": ref}
 
 
 # --- Envelope chống sybil + thống kê hoạt động (đọc từ chính sổ cái) ---------------

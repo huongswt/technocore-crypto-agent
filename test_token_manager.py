@@ -642,3 +642,30 @@ def test_credit_hour_buckets_are_recorded(ledger):
     tm.credit("5", path=ledger)
     buckets = tm.load_ledger(ledger)["credit_by_hour"]["FLOP"]
     assert len(buckets) == 1 and list(buckets.values())[0] == ["105", 2]
+
+
+def test_gateway_spend_books_only_on_testnet_and_counts_as_a_session(ledger, monkeypatch):
+    tm.credit("10", path=ledger)
+    assert tm.record_gateway_spend("1.5", "inference-session gateway m1", "chatcmpl-1",
+                                   path=ledger)["outcome"] == "skipped_simulation"
+    monkeypatch.setenv("TESTNET_ENABLED", "true")
+    assert tm.record_gateway_spend("1.5", "inference-session gateway m1", "", path=ledger)["outcome"] \
+        == "skipped_insufficient"                                       # không bằng chứng -> không ghi
+    r = tm.record_gateway_spend("1.5", "inference-session gateway m1", "chatcmpl-1", path=ledger)
+    assert r["outcome"] == "spent_onchain"
+    led = tm.load_ledger(ledger)
+    assert led["session_cumulative"]["FLOP"] == "1.5" and led["entries"][-1]["via"] == "gateway"
+    assert tm.record_gateway_spend("50", "inference-session gateway m1", "chatcmpl-2",
+                                   path=ledger)["balance_after"] == "0"  # kẹp 0, không âm
+
+
+def test_gateway_booking_is_idempotent_inside_the_ledger(ledger, monkeypatch):
+    # Danh sách "biên nhận đã ghi" của gateway nằm ở state.json; cache mất -> thấy lại biên nhận
+    # cũ. Sổ cái phải tự chặn ghi lần hai (tổng chi chỉ tăng nên ghi trùng là VĨNH VIỄN).
+    monkeypatch.setenv("TESTNET_ENABLED", "true")
+    assert tm.record_gateway_spend("6.5", "inference-session gateway m1", "req-1", path=ledger)["outcome"] \
+        == "spent_onchain"
+    assert tm.record_gateway_spend("6.5", "inference-session gateway m1", "req-1", path=ledger)["outcome"] \
+        == "duplicate"
+    led = tm.load_ledger(ledger)
+    assert led["session_cumulative"]["FLOP"] == "6.5" and len(led["gateway_refs"]) == 1

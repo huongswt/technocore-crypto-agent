@@ -14,6 +14,14 @@ hợp lệ, không dump.
 Env:
   FLOP_FAUCET_ENABLED       bật (mặc định tắt -> skipped_disabled).
   FLOP_FAUCET_URL           endpoint faucet (điền khi FLOP công bố). Rỗng -> unconfigured.
+  FLOP_FAUCET_ADDRESS       địa chỉ SS58 nhận FLOP. Có -> gửi đúng định dạng faucet.flop.network
+                            (`POST /fund {"address": ...}`) và học chu kỳ từ <origin>/health.
+                            Kiểm checksum trước khi gửi (sai 1 ký tự = mất FLOP).
+  FLOP_FAUCET_TIER          quick (mặc định, 25 FLOP) | linked (verified human, 500-2000)
+                            | manual (operator tự xin Verified bằng MetaMask -> agent KHÔNG xin:
+                            chu kỳ 24h tính chung mọi mức, lượt quick sẽ chặn lượt Verified).
+  FLOP_FAUCET_PROVIDER      với linked: brightid | self — chứng minh người thật đã được NGƯỜI
+                            gắn vào địa chỉ này. MetaMask/SIWE cần người ký mỗi lần -> agent từ chối.
   FLOP_FAUCET_AMOUNT        lượng dự kiến mỗi claim (mặc định 100).
   FLOP_FAUCET_COOLDOWN_HOURS khoảng tối thiểu giữa 2 claim (mặc định 24). 'auto' = THĂM DÒ:
                             thử mỗi AUTO_PROBE_HOURS (1h); faucet trả thời điểm claim kế tiếp
@@ -198,7 +206,7 @@ def state_path(path: str = None) -> str:
 
 def _load(path: str = None) -> dict:
     try:
-        with open(state_path(path), "r") as f:
+        with open(state_path(path), "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except FileNotFoundError:
@@ -210,7 +218,7 @@ def _load(path: str = None) -> dict:
 
 def _save(state: dict, path: str = None) -> None:
     try:
-        with open(state_path(path), "w") as f:
+        with open(state_path(path), "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[faucet] không lưu được state: {e}")

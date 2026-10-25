@@ -16,6 +16,33 @@ MULTICODEC_ED25519 = b"\xed\x01"
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
+def b58decode(s: str):
+    """Base58 (bảng chữ Bitcoin) -> bytes; ký tự lạ -> None."""
+    n = 0
+    for c in s:
+        i = B58.find(c)
+        if i < 0:
+            return None
+        n = n * 58 + i
+    raw = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    return b"\0" * (len(s) - len(s.lstrip("1"))) + raw
+
+
+def ss58_valid(addr: str) -> bool:
+    """Địa chỉ SS58 (Substrate — tài khoản FLOP) của 1 tài khoản 32 byte, checksum đúng.
+    Prefix 1 byte (0..63) hoặc 2 byte; checksum = blake2b-512("SS58PRE"+payload)[:2]."""
+    if not isinstance(addr, str) or not 40 <= len(addr) <= 50:
+        return False
+    raw = b58decode(addr)
+    if raw is None or len(raw) not in (35, 36):
+        return False
+    plen = 1 if raw[0] < 64 else 2
+    if len(raw) != plen + 32 + 2:
+        return False
+    body = raw[:-2]
+    return hashlib.blake2b(b"SS58PRE" + body, digest_size=64).digest()[:2] == raw[-2:]
+
+
 def multibase_b58(raw: bytes) -> str:
     n = int.from_bytes(raw, "big")
     out = ""
@@ -86,7 +113,7 @@ def _write_summary(lines) -> None:
     if not path:
         return
     try:
-        with open(path, "a") as f:
+        with open(path, "a", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
     except Exception as e:
         print(f"[summary] không ghi được: {e}")
@@ -747,7 +774,7 @@ def short_nick(did: str) -> str:
 # --- State (cursor last_seq) lưu qua các lần cron chạy bằng actions/cache ---
 def load_state() -> dict:
     try:
-        with open(STATE_FILE, "r") as f:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
@@ -759,7 +786,7 @@ def save_state(state: dict) -> None:
     try:
         merged = load_state()
         merged.update(state)
-        with open(STATE_FILE, "w") as f:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(merged, f)
     except Exception as e:
         print(f"[state] không lưu được: {e}")
@@ -1235,6 +1262,15 @@ def _proactive_budget_ok(room) -> bool:
         return True
     import flop_governor as _gov
     return _gov.headroom(_post_gov_state, room, _post_caps(), time.time()) > PROACTIVE_RESERVE
+
+
+def room_capped(room: str) -> bool:
+    """Phòng đã hết hạn mức đăng hôm nay (governor)? Hết hạn mức KHÔNG phải lỗi đường ghi:
+    bài đăng định kỳ bỏ qua tới ngày UTC mới, không báo "fail" và không gõ lại mỗi lượt."""
+    if not POST_GOVERNOR:
+        return False
+    import flop_governor as _gov
+    return _gov.is_capped(_post_gov_state, room, _post_caps(), time.time())
 
 
 def post_message(private_key, did, text, room=ROOM) -> bool:
@@ -1792,6 +1828,13 @@ def maybe_send_daily_report(state: dict, now: int, extras: dict = None) -> bool:
             pass
         # Rút gọn CHỈ cho tin nhắn — log Actions và job summary giữ bản đầy đủ.
         extras = dict(extras or {})
+        try:                                  # đường mua compute THẬT (gateway): nhịp + quota + biên nhận
+            import flop_gateway
+            _gl = flop_gateway.report_line(state.get(flop_gateway.KEY) or {}, now)
+            if _gl:
+                extras["gateway"] = _gl
+        except Exception:
+            pass
         if extras.get("kibble"):
             extras["kibble"] = fr.compact_kibble(extras["kibble"])
         try:                                  # dự phóng CHI qua kỳ testnet
@@ -1833,7 +1876,9 @@ def persist_ledger_to_kv(private_key, did) -> None:
                 "spend_count_by_hour": led.get("spend_count_by_hour", {}),
                 "credit_by_hour": led.get("credit_by_hour", {}),
                 "first_spend_day": led.get("first_spend_day"),
-                "unlock": led.get("unlock", {})}
+                "unlock": led.get("unlock", {}),
+                # Dấu băm biên nhận gateway đã ghi -> cache mất vẫn không ghi trùng.
+                "gateway_refs": (led.get("gateway_refs") or [])[-100:]}
         entries = (led.get("entries", []) or [])
         body = None
         # Cắt dần tới khi VỪA giới hạn. Số dư và các tổng chạy không suy từ entries, nên
@@ -1907,9 +1952,41 @@ def isolate_for_llm(user_text: str) -> str:
 
 _PROMPT_LABELS = ("UNTRUSTED", "LIVE MARKET DATA")
 
+# Link/địa chỉ ví trong output LLM: việc kibble và tin chat do người lạ viết có thể bảo model
+# "nhớ kèm link này / địa chỉ ví này" -> bài ký bằng DID của agent thành kênh phát tán lừa đảo.
+# Chỉ giữ link tới các domain dưới đây (tài liệu/nguồn dữ liệu agent vốn dùng); còn lại thay bằng
+# nhãn. Địa chỉ ví (EVM 0x…40 hex, BTC bech32) luôn bị thay — agent không có lý do đăng chúng.
+_LINK_ALLOW = ("github.com", "flop.network", "flop.finance", "technocore.chat",
+               "coingecko.com", "defillama.com", "wikipedia.org", "python.org", "mozilla.org",
+               "ethereum.org", "bitcoin.org")
+_URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)[^\s<>()\[\]{}\"']+")
+# Lượng từ CÓ CHẶN ({1,63}, {1,6}, {0,200}): bản không chặn quay lui theo cấp số mũ với
+# "a.a.a.a…" (ReDoS) — test với chuỗi 600k ký tự từng treo quá 5 phút.
+_BARE_DOMAIN_RE = re.compile(r"(?i)\b(?:[a-z0-9-]{1,63}\.){1,6}(?:com|net|org|io|xyz|app|finance|top|"
+                             r"site|online|link|click|claims?|airdrop|live|pro|info|co|me|cc|ly|"
+                             r"network|chat|ai|dev)"
+                             r"(?:/[^\s]{0,200})?\b")
+_EVM_ADDR_RE = re.compile(r"\b0x[0-9a-fA-F]{40}\b")
+_BTC_ADDR_RE = re.compile(r"\bbc1[02-9ac-hj-np-z]{25,87}\b")
+# Địa chỉ SS58 (ví FLOP/Substrate, "5…"): chỉ thay chuỗi CÓ checksum hợp lệ -> không ăn nhầm chữ.
+_SS58_CAND_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{46,48}\b")
+
+
+def _link_allowed(url: str) -> bool:
+    host = re.sub(r"(?i)^(?:https?://)?(?:www\.)?", "", url).split("/")[0].split(":")[0].lower()
+    return any(host == d or host.endswith("." + d) for d in _LINK_ALLOW)
+
+
+def scrub_links_and_addresses(text: str) -> str:
+    text = _URL_RE.sub(lambda m: m.group(0) if _link_allowed(m.group(0)) else "[link removed]", text)
+    text = _BARE_DOMAIN_RE.sub(lambda m: m.group(0) if _link_allowed(m.group(0)) else "[link removed]", text)
+    text = _EVM_ADDR_RE.sub("[address removed]", text)
+    text = _SS58_CAND_RE.sub(lambda m: "[address removed]" if ss58_valid(m.group(0)) else m.group(0), text)
+    return _BTC_ADDR_RE.sub("[address removed]", text)
+
 
 def guard_output(text: str):
-    """Lọc output LLM: chặn rò rỉ secret hoặc lộ system prompt/delimiter."""
+    """Lọc output LLM: chặn rò rỉ secret hoặc lộ system prompt/delimiter; gỡ link lạ và địa chỉ ví."""
     if not text:
         return None
     for pat in _SECRET_PATTERNS:
@@ -1926,7 +2003,10 @@ def guard_output(text: str):
     if any(label in text for label in _PROMPT_LABELS):
         print("[guard] output blocked: prompt label echoed")
         return None
-    return text
+    cleaned = scrub_links_and_addresses(text)
+    if cleaned != text:
+        print("[guard] gỡ link lạ / địa chỉ ví khỏi output")
+    return cleaned
 
 
 # Mẫu mở đầu câu TỪ CHỐI của model — không phải deliverable thật. Chỉ khớp ở ĐẦU câu (sau khi bỏ
@@ -2127,8 +2207,11 @@ def _gemini_note_404(model, e) -> None:
 def _gemini_list_models():
     """Model hỗ trợ generateContent trên key hiện tại (đã strip 'models/'), ĐÃ LỌC model
     không-chat (tts/ảnh/embed/...) — gọi chat với chúng chỉ tốn call vô ích (400/429)."""
+    # Khoá đi qua HEADER, không nằm trong URL: lỗi của requests in nguyên URL, mà log Actions
+    # của repo công khai — không để việc giấu khoá phụ thuộc vào cơ chế che secret của GitHub.
     r = requests.get(
-        f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}&pageSize=1000",
+        "https://generativelanguage.googleapis.com/v1beta/models",
+        params={"pageSize": 1000}, headers={"x-goog-api-key": GEMINI_API_KEY},
         timeout=15,
     )
     r.raise_for_status()
@@ -2184,16 +2267,13 @@ def _gemini_candidates():
 
 def _gemini_call(model: str, user_text: str, system: str, temperature: float,
                  max_tokens: int = 120) -> str:
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model}:generateContent?key={GEMINI_API_KEY}"
-    )
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     body = {
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": [{"text": user_text}]}],
         "generationConfig": {"maxOutputTokens": max_tokens, "temperature": temperature},
     }
-    r = requests.post(url, json=body, timeout=20)
+    r = requests.post(url, json=body, headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=20)
     r.raise_for_status()
     return r.json()["candidates"][0]["content"]["parts"][0]["text"]
 
@@ -2719,6 +2799,22 @@ def _kibble_remember(fp) -> None:
         ttl_ms=_kibble_dup_ttl_ms())
 
 
+_gateway_jobs_new = []               # job kibble đã trả lời trong run này -> hàng đề gateway
+GATEWAY_JOBS_KEEP = 30
+
+
+def queue_gateway_jobs(state: dict) -> None:
+    """Đẩy job vừa làm vào hàng đề bền state['gateway_jobs'] (chống trùng theo id, giữ N mới nhất)."""
+    q = [j for j in (state.get("gateway_jobs") or []) if isinstance(j, dict) and j.get("task")]
+    have = {j.get("id") for j in q}
+    for j in _gateway_jobs_new:
+        if j.get("id") not in have:
+            q.append(j)
+            have.add(j.get("id"))
+    _gateway_jobs_new.clear()
+    state["gateway_jobs"] = q[-GATEWAY_JOBS_KEEP:]
+
+
 def answer_kibble_job(job: dict):
     """Sinh nội dung bàn giao cho MỘT job kibble. Nội dung job là UNTRUSTED (do agent lạ
     đăng) -> BẮT BUỘC đi qua isolate_for_llm + guard_output như reply cho người lạ. Trả None
@@ -2777,6 +2873,9 @@ def answer_kibble_job(job: dict):
     _meter_flop(f"{provider} kibble:{jtype}", event_id=job.get("jobid"))
     print(f"[kibble:{provider}] answered {job.get('jobid')} ({jtype})")
     _kibble_remember(fp)
+    # Job agent ĐÃ LÀM THẬT -> đề cho lần mua compute qua gateway (việc thật, không phải đề
+    # lặp lại: tài khoản bị gắn cờ "manufactured activity" mất toàn bộ phần airdrop).
+    _gateway_jobs_new.append({"id": str(job.get("jobid") or "")[:40], "task": task[:1500]})
     return text
 
 
@@ -3113,11 +3212,63 @@ def _mempool_submit_fn(req: dict) -> dict:
     }
 
 
+_faucet_default_addr = None          # địa chỉ SS58 của VÍ gateway (DID) — faucet_step đặt mỗi run
+
+
+def _faucet_body(req: dict):
+    """Thân yêu cầu faucet. Có FLOP_FAUCET_ADDRESS -> định dạng THẬT của faucet.flop.network
+    (`POST /fund {"address": <SS58>}`; mức verified: + tier=linked, provider=brightid|self).
+    Không có -> payload ký kiểu cũ của scaffold. Trả (body, flop_format)."""
+    # Trống -> dùng chính VÍ gateway (cùng tài khoản mua compute; ngày testnet không phải đặt
+    # thêm biến). Không có ví -> payload ký kiểu scaffold cũ như trước.
+    addr = os.environ.get("FLOP_FAUCET_ADDRESS", "").strip() or (_faucet_default_addr or "")
+    if not addr:
+        return (req.get("signed") or {}), False
+    if not ss58_valid(addr):
+        # Sai 1 ký tự = FLOP rơi vào ví không ai giữ khoá. Từ chối thay vì gửi.
+        raise RuntimeError("FLOP_FAUCET_ADDRESS không phải địa chỉ SS58 hợp lệ — kiểm tra lại")
+    body = {"address": addr}
+    tier = os.environ.get("FLOP_FAUCET_TIER", "quick").strip().lower()
+    if tier == "linked":
+        provider = os.environ.get("FLOP_FAUCET_PROVIDER", "").strip().lower()
+        if provider not in ("brightid", "self"):
+            # Đường EVM/SIWE cần NGƯỜI ký lại mỗi lần (chữ ký hết hạn sau 10 phút) — agent
+            # không giữ ví người và không tự làm chứng minh người thật.
+            raise RuntimeError("FLOP_FAUCET_TIER=linked cần FLOP_FAUCET_PROVIDER=brightid|self "
+                               "(đã gắn chứng minh vào địa chỉ này); đường MetaMask/SIWE phải bấm tay")
+        body.update({"tier": "linked", "provider": provider})
+    elif tier not in ("quick", ""):
+        raise RuntimeError(f"FLOP_FAUCET_TIER={tier!r} không hỗ trợ (quick|linked|manual)")
+    return body, True
+
+
+def _faucet_cooldown_s(faucet_url: str, linked: bool):
+    """Chu kỳ claim faucet CÔNG BỐ ở <origin>/health (limits.addressCooldownMs, mức verified
+    lấy max với identityCooldownMs) -> giây, hoặc None. Để 'auto' hẹn đúng 24h thay vì thăm dò
+    mỗi giờ và bị từ chối ~23 lần/ngày."""
+    m = re.match(r"(?i)^(https?://[^/]+)", faucet_url or "")
+    if not m:
+        return None
+    try:
+        r = requests.get(m.group(1) + "/health", headers={"User-Agent": UA}, timeout=10)
+        lim = (r.json() or {}).get("limits") if r.status_code == 200 else None
+        if not isinstance(lim, dict):
+            return None
+        ms = [lim.get("addressCooldownMs")] + ([lim.get("identityCooldownMs")] if linked else [])
+        ms = [int(float(v)) for v in ms if v is not None]
+        return (max(ms) // 1000 + 60) if ms and max(ms) > 0 else None     # +60s biên an toàn
+    except (requests.RequestException, ValueError, TypeError, AttributeError):
+        return None
+
+
 def _faucet_claim_fn(req: dict) -> dict:
-    """Claim token testnet: POST payload đã ký tới faucet_url, đọc {amount}. Ném lỗi nếu
-    HTTP fail (flop_faucet.run_faucet_cycle bắt -> error_claim)."""
+    """Claim token testnet: POST tới faucet_url, đọc {amount}. Ném lỗi nếu HTTP fail
+    (flop_faucet.run_faucet_cycle bắt -> error_claim)."""
     url = req.get("faucet_url")
-    r = requests.post(url, json=req.get("signed") or {},
+    body, flop_format = _faucet_body(req)
+    if flop_format and re.match(r"(?i)^https?://[^/]+/?$", url or ""):
+        url = url.rstrip("/") + "/fund"          # FLOP_FAUCET_URL chỉ có tên miền -> endpoint /fund
+    r = requests.post(url, json=body,
                       headers={"User-Agent": UA, "Content-Type": "application/json"}, timeout=20)
     if r.status_code == 429:
         # Chưa tới lượt: faucet nói chờ bao lâu -> flop_faucet hẹn đúng giờ, không gõ lại dồn dập.
@@ -3125,14 +3276,24 @@ def _faucet_claim_fn(req: dict) -> dict:
             body = r.json() if r.content else {}
         except ValueError:
             body = {}
-        wait = _faucet_retry_after(r.headers.get("Retry-After"), body if isinstance(body, dict) else {})
+        wait = _faucet_retry_after(r.headers.get("Retry-After"), body if isinstance(body, dict) else {}, True)
         return {"amount": 0, "retry_after_s": wait if wait is not None else 3600}
-    r.raise_for_status()
-    data = r.json() if r.content else {}
+    try:
+        data = r.json() if r.content else {}
+    except ValueError:
+        data = {}
     if not isinstance(data, dict):
         data = {}
-    _wait = _faucet_retry_after(None, data)
+    if r.status_code >= 400:
+        # Faucet từ chối với thời gian chờ trong câu chữ (400/403...): là "chưa tới lượt", KHÔNG
+        # phải lỗi — nếu coi là lỗi thì agent gõ lại mỗi giờ (~22 lần bị từ chối/ngày).
+        _wait = _faucet_retry_after(r.headers.get("Retry-After"), data, True)
+        if _wait is not None:
+            print(f"[faucet] chưa tới lượt (HTTP {r.status_code}) — chờ {_wait // 60} phút")
+            return {"amount": 0, "retry_after_s": _wait}
+        r.raise_for_status()
     err = _api_error(data)
+    _wait = _faucet_retry_after(None, data, bool(err))
     if err:
         if _wait is not None:                          # "chưa tới lượt, quay lại sau N giây"
             return {"amount": 0, "retry_after_s": _wait}
@@ -3146,13 +3307,19 @@ def _faucet_claim_fn(req: dict) -> dict:
               f"(keys: {sorted(data)[:15]})")
         amt = req.get("amount")
     out = {"amount": amt}
+    if flop_format and data.get("txHash"):
+        out["tx"] = str(data["txHash"])[:80]
+        print(f"[faucet] +{amt} FLOP ({data.get('tier') or 'quick'}) tx={out['tx']}")
+    if _wait is None and flop_format:
+        _wait = _faucet_cooldown_s(url, body.get("tier") == "linked")
     if _wait is not None:
         out["retry_after_s"] = _wait
     return out
 
 
-def _faucet_retry_after(header, body: dict):
-    """Số giây tới lượt claim kế tiếp từ header Retry-After hoặc thân phản hồi; None nếu không có."""
+def _faucet_retry_after(header, body: dict, text: bool = False):
+    """Số giây tới lượt claim kế tiếp từ header Retry-After hoặc thân phản hồi; None nếu không có.
+    `text=True` (CHỈ khi faucet từ chối) -> đọc cả thời gian chờ viết trong câu chữ."""
     if header is not None:
         try:
             return max(0, int(float(str(header).strip())))
@@ -3179,7 +3346,33 @@ def _faucet_retry_after(header, body: dict):
                 return max(0, int(t - time.time()))
             except ValueError:
                 continue
+    for k in (("error", "message", "detail", "reason") if text else ()):   # chờ viết trong CÂU CHỮ
+        w = _wait_from_text(body.get(k))
+        if w is not None:
+            return w
     return None
+
+
+_WAIT_UNITS = {"s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1, "giây": 1,
+               "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60, "phút": 60,
+               "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600, "giờ": 3600}
+_WAIT_RE = re.compile(r"(?i)(?:in|after|sau|wait|retry|again)\D{0,20}?(\d{1,6}(?:\.\d+)?)\s*"
+                      r"(seconds?|secs?|sec|s|minutes?|mins?|min|m|hours?|hrs?|hr|h|giây|phút|giờ)\b")
+
+
+def _wait_from_text(text):
+    """Số giây chờ trong câu báo của faucet, vd devnet 2026-10-24: "This address was just
+    funded; try again in 1306 minutes" / "...thử lại sau 1306 phút". Không thấy -> None."""
+    if not isinstance(text, str) or not text:
+        return None
+    m = _WAIT_RE.search(text)
+    if not m:
+        return None
+    unit = m.group(2).lower()
+    mult = _WAIT_UNITS.get(unit) or _WAIT_UNITS.get(unit.rstrip("s"))
+    if not mult:
+        return None
+    return max(0, int(float(m.group(1)) * mult))
 
 
 def faucet_step(state: dict, private_key, did) -> str:
@@ -3188,6 +3381,23 @@ def faucet_step(state: dict, private_key, did) -> str:
     đều tưởng chưa claim lần nào: gõ faucet 288 lần/ngày, trần ngày vô tác dụng."""
     if os.environ.get("FLOP_FAUCET_ENABLED", "").strip().lower() not in ("1", "true", "on", "yes"):
         return "off"
+    # Chu kỳ 24h của faucet tính CHUNG cho mọi mức trên một địa chỉ (đo devnet 2026-10-24: nhận
+    # quick 25 xong thì xin Verified báo "vừa được cấp vốn"). Operator tự xin Verified bằng
+    # MetaMask (ký tay mỗi ngày) -> FLOP_FAUCET_TIER=manual: agent KHÔNG xin, để lượt 24h đó
+    # dành cho mức 500-2000.
+    tier = os.environ.get("FLOP_FAUCET_TIER", "").strip().lower() or "quick"
+    if tier == "manual":
+        print("[faucet] manual — operator tự xin mức Verified; agent không xin để không chặn lượt 24h")
+        return "manual"
+    if tier == "quick" and not state.get("faucet_quick_warned"):
+        msg = ("ℹ️ Faucet: agent đang tự xin mức QUICK (25 FLOP/ngày). Chu kỳ 24h tính chung mọi mức "
+               "trên địa chỉ này, nên nếu anh định tự xin mức Verified (500–2000) bằng MetaMask thì "
+               "lượt quick của agent sẽ CHẶN nó. Khi đó đặt FLOP_FAUCET_TIER=manual; còn nếu đã gắn "
+               "BrightID/Self vào ví thì đặt FLOP_FAUCET_TIER=linked + FLOP_FAUCET_PROVIDER.")
+        print(f"[faucet] {msg}")
+        if _telegram_send(msg):
+            state["faucet_quick_warned"] = int(time.time())
+            save_state({"faucet_quick_warned": state["faucet_quick_warned"]})
     try:
         import token_manager
         if not token_manager.testnet_enabled():
@@ -3197,6 +3407,25 @@ def faucet_step(state: dict, private_key, did) -> str:
             print("[faucet] bỏ qua — FLOP_FAUCET_ENABLED bật nhưng TESTNET_ENABLED tắt: "
                   "faucet thật chỉ chạy cùng sổ testnet (bật TESTNET_ENABLED trước).")
             return "skipped_simulation"
+        global _faucet_default_addr
+        try:
+            import flop_gateway
+            _wk = flop_gateway.wallet_key(private_key)
+            _faucet_default_addr = flop_gateway.wallet_address(_wk) if _wk else None
+        except Exception:
+            _faucet_default_addr = None
+        _env_addr = os.environ.get("FLOP_FAUCET_ADDRESS", "").strip()
+        if (_env_addr and _faucet_default_addr and _env_addr != _faucet_default_addr
+                and state.get("faucet_addr_warned") != _env_addr):
+            # Faucet nạp vào ví KHÁC ví mua compute -> gateway báo ví chưa có tiền, và chi tiêu
+            # (thứ được tính airdrop) nằm ở tài khoản khác. Có thể cố ý -> chỉ cảnh báo 1 lần.
+            _m = (f"⚠️ Faucet nạp vào {_env_addr[:8]}…{_env_addr[-4:]} nhưng ví mua compute (gateway) là "
+                  f"{_faucet_default_addr[:8]}…{_faucet_default_addr[-4:]}. Nếu không cố ý, xoá "
+                  "FLOP_FAUCET_ADDRESS để faucet tự dùng ví gateway.")
+            print(f"[faucet] {_m}")
+            if _telegram_send(_m):
+                state["faucet_addr_warned"] = _env_addr
+                save_state({"faucet_addr_warned": _env_addr})
         import flop_faucet
         fpath = flop_faucet.state_path()
         flop_faucet._save(flop_faucet.merge_state(flop_faucet._load(fpath), state.get("faucet_state")),
@@ -3219,6 +3448,10 @@ def faucet_step(state: dict, private_key, did) -> str:
                                               private_key=private_key, did=did)
         status = fr.get("outcome", "?")
         print(f"[faucet] {status}" + (f" — {fr['reason']}" if fr.get("reason") else ""))
+        if status == "claimed":
+            # Khoản nạp vừa vào sổ: lưu sổ cái NGAY (mốc "đã xin" lưu ở state.json ngay dưới đây;
+            # run chết trước persist cuối run thì sổ thiếu vĩnh viễn khoản nạp này).
+            persist_ledger_to_kv(private_key, did)
         state["faucet_state"] = flop_faucet._load(fpath)
         save_state({"faucet_state": state["faucet_state"]})
         return status
@@ -3687,6 +3920,12 @@ def _respond_room(private_key, did, room, messages, last_seq, state, now, my_nic
         if frm == did:
             cursor = seq                  # tin của chính mình (telemetry): coi như đã xét
             continue
+        if frm in PROACTIVE_DENY_DIDS:
+            # Agent cùng gốc fork: KHÔNG trả lời cả khi họ nhắc ta trước. Trước đây danh sách
+            # chỉ chặn việc CHỦ ĐỘNG nhắn; nếu bên kia bỏ chặn và chào ta, hai agent cùng gốc
+            # sẽ nhắc qua lại — đúng dấu hiệu "cụm tự nói chuyện với nhau".
+            cursor = seq
+            continue
         text = sanitize_input(m.get("text", ""))   # cô lập input tại ranh giới ingestion
         is_peer = frm.startswith("did:key:")
         try:
@@ -4020,6 +4259,141 @@ def start_jitter_seconds(raw, rng=None):
     return (rng or random).uniform(0, n)
 
 
+def _gateway_prompts(now: int, ctx: str = "") -> list:
+    """Đề bài cho các lần mua compute qua gateway. KHÔNG có pool mặc định dùng chung: biên
+    nhận on-chain mang prompt_hash, nên các fork gửi cùng đề = trùng hash công khai (tín hiệu
+    sybil). Nguồn: FLOP_GATEWAY_PROMPTS ('a|b|c') của operator, không có thì phần thân các câu
+    FLOP_KIBBLE_REQUEST_QUESTIONS (cũng do operator đặt). Mỗi đề kèm mốc giờ UTC + DID ngắn
+    -> mỗi lần gọi một prompt khác nhau."""
+    raw = [p.strip() for p in os.environ.get("FLOP_GATEWAY_PROMPTS", "").split("|") if p.strip()]
+    if not raw:
+        raw = [q["body"] for q in KIBBLE_REQ_QUESTIONS if q.get("body")]
+    stamp = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(now))
+    if ctx:
+        # Số liệu thị trường LIVE do chính agent dựng (trusted) -> mỗi đề là một câu hỏi khác thật
+        # sự, gắn với tình hình lúc đó, thay vì 120 câu cố định lặp lại khi faucet lớn.
+        return [f"{p}\n\nLive market context ({stamp}): {ctx}\n"
+                "(Use the figures where relevant; answer concretely.)" for p in raw[:200]]
+    return [f"{p}\n\n(Answer concretely; as of {stamp}.)" for p in raw[:200]]
+
+
+def _gateway_http(method, url, headers=None, json=None, timeout=20):
+    return requests.request(method, url, headers={"User-Agent": UA, **(headers or {})},
+                            json=json, timeout=timeout)
+
+
+def gateway_session_step(state: dict, private_key, now: int):
+    """Mua compute qua api.flop.network (FLOP_SESSION_BACKEND=gateway). Trả
+    (session_status, settled_count, last) cho dòng [session] và bộ canh chi thật.
+
+    TESTNET_ENABLED bật -> chỉ chi khi gateway báo mạng FLOP_GATEWAY_NETWORK (mặc định
+    'testnet'), và ghi sổ testnet từng lần (memo phiên -> tính vào thước đo airdrop).
+    Tắt -> CHẠY TẬP trên mạng FLOP_GATEWAY_NETWORK (mặc định 'devnet'): gọi thật nhưng KHÔNG
+    ghi sổ (devnet không tính gì). Không ném lỗi."""
+    import flop_gateway
+    import token_manager as _tm
+    testnet = _tm.testnet_enabled()
+    expect = (os.environ.get("FLOP_GATEWAY_NETWORK", "").strip().lower()
+              or ("testnet" if testnet else "devnet"))
+    # Đề ưu tiên = job kibble THẬT agent vừa làm (mỗi đề một việc khác nhau, có người đặt);
+    # hết job mới dùng đề của operator. Nội dung job là UNTRUSTED -> isolate như mọi chỗ khác.
+    jobs = [j for j in (state.get("gateway_jobs") or []) if isinstance(j, dict) and j.get("task")]
+    # Đề dự phòng của operator chỉ cần khi hàng job không đủ cho một lượt -> chỉ lúc đó mới tốn
+    # một lần lấy số liệu thị trường live.
+    ctx = ""
+    if len(jobs) < int(_env_float("FLOP_GATEWAY_MAX_CALLS_PER_RUN", 2)):
+        try:
+            ctx = build_market_context()
+        except Exception:
+            ctx = ""
+    op = _gateway_prompts(now, ctx)
+    op_idx = int(state.get("gateway_op_idx") or 0) % max(1, len(op))
+    if jobs:
+        # Job trước, rồi đề operator (xoay vòng) -> hàng còn 1 job mà gọi 2 lần thì lần hai
+        # dùng đề KHÁC, không gửi lại cùng job.
+        prompts = [isolate_for_llm(j["task"]) + "\n\nComplete the task above concretely and accurately."
+                   for j in jobs] + op[op_idx:] + op[:op_idx]
+        g0 = state.get(flop_gateway.KEY)
+        if isinstance(g0, dict):
+            g0["prompt_idx"] = 0                      # thứ tự do danh sách trên quyết định
+    else:
+        prompts = op
+    if not prompts:
+        print("[gateway] chưa có đề bài (job kibble / FLOP_GATEWAY_PROMPTS / "
+              "FLOP_KIBBLE_REQUEST_QUESTIONS) — không dùng đề mặc định chung với fork")
+        return "skip-unconfigured", 0, {"reason": "no prompts"}
+
+    def book(cost, ref, model):
+        return _tm.record_gateway_spend(cost, f"{flop_gateway.SESSION_MEMO} {model}", ref)
+
+    r = flop_gateway.run_step(
+        state, agent_key=private_key, now=now, prompts=prompts, expect_network=expect,
+        http=_gateway_http,
+        book_fn=book if testnet else None)
+    if testnet and r.get("receipts_new"):
+        # Lưu sổ cái NGAY: biên nhận vừa ghi đã được đánh dấu "đã ghi" trong state.json (cache lưu
+        # cả khi run lỗi). Nếu chỉ đợi persist cuối run mà run chết giữa chừng thì số chi mất
+        # VĨNH VIỄN (lượt sau coi biên nhận đã ghi rồi). persist ghi KV + bản sao state.json.
+        persist_ledger_to_kv(private_key, did_of(private_key))
+    if jobs and r.get("calls"):
+        used = int(r["calls"])
+        state["gateway_jobs"] = jobs[used:]              # job đã dùng làm đề -> ra khỏi hàng
+        if used > len(jobs) and op:                      # phần còn lại dùng đề operator
+            state["gateway_op_idx"] = (op_idx + used - len(jobs)) % len(op)
+    save_state({flop_gateway.KEY: state.get(flop_gateway.KEY),
+                "gateway_jobs": state.get("gateway_jobs", []),
+                "gateway_op_idx": state.get("gateway_op_idx", 0)})
+    oc = r.get("outcome")
+    tag = "" if testnet else " (devnet tập, không ghi sổ)"
+    status = f"{r.get('calls', 0)}✓ gateway/{oc}"
+    _l = r.get("last") or {}
+    detail = (f" spent={r.get('spent')} due={r.get('due')} quota={r.get('remaining')}"
+              + (f" tokens={_l.get('tokens')} src={_l.get('src')}" if _l else "")
+              + (f" settled={r.get('settled_total')}/{r.get('receipts_total')}rc"
+                 if r.get("receipts_total") is not None else "")
+              if oc in ("spent", "pace_wait") else "")
+    src = f" đề=job×{min(len(jobs), int(r.get('calls') or 0))}" if jobs else " đề=operator"
+    print(f"[session] {status}{detail}{src}{tag}")
+    if r.get("reason"):
+        print(f"[gateway] lý do: {str(r['reason'])[:200]}")
+    # Chi tụt lại so với kế hoạch nhiều giờ -> Telegram kèm lý do (chỉ khi chi THẬT trên
+    # testnet; buổi tập devnet chỉ in log vì allowance devnet lớn hơn sức chi rất nhiều).
+    try:
+        g = state.get(flop_gateway.KEY) or {}
+        line, alert, ok = flop_gateway.lag_status(
+            g, now, oc or "?", pct=_env_float("FLOP_GATEWAY_LAG_PCT", 10),
+            alert_hours=_env_float("FLOP_GATEWAY_LAG_ALERT_HOURS", 3),
+            realert_hours=_env_float("FLOP_GATEWAY_LAG_REALERT_HOURS", 6))
+        state[flop_gateway.KEY] = g
+        save_state({flop_gateway.KEY: g})
+        if line:
+            print(line)
+        for msg in (alert, ok):
+            if msg and testnet:
+                _telegram_send(msg)
+    except Exception as e:
+        print(f"[gateway] lag-check bỏ qua ({str(e)[:80]})")
+    if r.get("payment"):
+        print(f"[gateway] 402 hình dạng thanh toán (KHÔNG tự trả): {r['payment']}")
+    if r.get("receipts_new"):
+        print(f"[gateway] biên nhận on-chain mới: {r['receipts_new']}")
+        try:
+            import flop_miners as _fm
+            st = dict(_miner_stats)
+            for m in r.get("miners") or []:
+                st = _fm.record_settled(st, m)
+            _miner_stats.clear()
+            _miner_stats.update(st)
+            save_state({_miner_stats_key(): _miner_stats})
+        except Exception as e:
+            print(f"[miners] bỏ qua ({str(e)[:80]})")
+    # "Đã settle" = biên nhận settle mới run này (ghi sổ theo settled_spend), không phải số lần gọi.
+    settled = int(r.get("receipts_new") or 0) if testnet else 0
+    last = {"stage": "gateway", "outcome": "spent_onchain" if settled else oc,
+            "reason": r.get("reason", "")}
+    return status, settled, last
+
+
 def session_budget_plan(sess_fee, sess_flops, sess_max, now: int = None):
     """Kế hoạch chi phiên cho FLOP_SESSION_BUDGET=auto -> (plan, due).
 
@@ -4110,7 +4484,10 @@ def main():
     tele_status = "skip"
     if force or _due(state, "last_telemetry", TELEMETRY_INTERVAL_H, now,
                      phase_s=_did_cadence_offset(did)):
-        if broadcast_telemetry(private_key, did):
+        if room_capped(ROOM):
+            tele_status = "cap"
+            print(f"[telemetry] r/{ROOM} đã hết hạn mức hôm nay — chờ sang ngày UTC mới (không phải lỗi)")
+        elif broadcast_telemetry(private_key, did):
             save_state({"last_telemetry": now})
             tele_status = "ok"
         else:
@@ -4124,7 +4501,10 @@ def main():
     #     Cùng nguyên tắc: chỉ đóng cổng khi post thành công.
     manifest_status = "skip"
     if _due(state, "last_manifest", MANIFEST_INTERVAL_H, now):
-        if broadcast_manifest(private_key, did):
+        if room_capped(MANIFEST_ROOM):
+            manifest_status = "cap"
+            print(f"[manifest] r/{MANIFEST_ROOM} đã hết hạn mức hôm nay — chờ sang ngày UTC mới (không phải lỗi)")
+        elif broadcast_manifest(private_key, did):
             save_state({"last_manifest": now})
             manifest_status = "ok"
         else:
@@ -4151,7 +4531,9 @@ def main():
     digest_status = "off"
     if DIGEST_ENABLED:
         if _due(state, "last_digest", DIGEST_INTERVAL_H, now):
-            if broadcast_digest(private_key, did):
+            if room_capped(ROOM):
+                digest_status = "cap"           # kiểm TRƯỚC: digest tốn 1 lần suy luận LLM
+            elif broadcast_digest(private_key, did):
                 save_state({"last_digest": now})
                 digest_status = "ok"
             else:
@@ -4175,6 +4557,8 @@ def main():
                 status_feed_status = "skip-outage"
                 print("[status-feed] bỏ qua — đường ghi technocore.chat đang lỗi "
                       f"(post ok={_post_ok_count} fail={_post_fail_count}); không cố post.")
+            elif not STATUS_FEED_DRY_RUN and room_capped(STATUS_FEED_ROOM):
+                status_feed_status = "cap"
             elif broadcast_status_feed(private_key, did, state):
                 save_state({"last_status_feed": now})
                 status_feed_status = "dry" if STATUS_FEED_DRY_RUN else "ok"
@@ -4197,7 +4581,9 @@ def main():
             state["last_recap"] = now
             recap_status = "seed"
         elif _due(state, "last_recap", RECAP_INTERVAL_H, now):
-            if broadcast_recap(private_key, did, state, now):
+            if room_capped(ROOM):
+                recap_status = "cap"
+            elif broadcast_recap(private_key, did, state, now):
                 save_state({"last_recap": now})
                 recap_status = "ok"
             else:
@@ -4212,8 +4598,13 @@ def main():
         print(f"[ask] {ask}")
         post_message(private_key, did, build_reply("you", ask, state=state))
 
-    # 3) Tương tác 2 chiều: đọc room & trả lời tin gọi đích danh (LUÔN chạy)
-    replies, proactive = auto_respond(private_key, did)
+    # 3) Tương tác 2 chiều: đọc room & trả lời tin gọi đích danh (LUÔN chạy). Bọc riêng: tin
+    #    trong phòng là dữ liệu của người lạ; lỗi ở đây KHÔNG được kéo sập kibble/phiên/sổ cái.
+    try:
+        replies, proactive = auto_respond(private_key, did)
+    except Exception as e:
+        replies, proactive = 0, 0
+        print(f"[respond] bỏ qua vòng này ({type(e).__name__}: {str(e)[:80]})")
 
     # 3a2) (Tùy chọn, GATED) Kibble worker — nhận JOB trên /r/kibble (board FLOP Labs),
     #      làm bằng inference THẬT rồi CLAIM+DELIVER. Mặc định TẮT; khi bật thì DRY-RUN cho
@@ -4245,9 +4636,11 @@ def main():
                 recent_fps=_kibble_recent_fps, dup_sim=KIBBLE_DUP_SIM,
                 now_ms=int(time.time() * 1000), ttl_ms=_kibble_dup_ttl_ms(),
             )
+            queue_gateway_jobs(state)
             save_state({"kibble_cursor": state.get("kibble_cursor"),
                         "kibble_done": state.get("kibble_done", []),
-                        "kibble_recent_fps": _kibble_recent_fps})
+                        "kibble_recent_fps": _kibble_recent_fps,
+                        "gateway_jobs": state.get("gateway_jobs", [])})
             mode = "dry" if KIBBLE_DRY_RUN else "live"
             kibble_status = f"{mode} {len(ks['delivered'])}✓/{ks['skipped']}skip/{ks['scanned']}scan"
             # Tracker ATTEST (GATED): ghi DELIVER thật của mình + đối chiếu rh của ATTEST trong
@@ -4440,7 +4833,21 @@ def main():
     #      Bọc kín: lỗi bị nuốt, không làm sập run.
     session_status = "off"
     _wd_settled, _wd_last = 0, {}              # cho bộ canh chi thật (testnet) bên dưới
-    if os.environ.get("FLOP_SESSION_ENABLED", "").strip().lower() in ("1", "true", "on", "yes"):
+    _sess_on = os.environ.get("FLOP_SESSION_ENABLED", "").strip().lower() in ("1", "true", "on", "yes")
+    _backend = os.environ.get("FLOP_SESSION_BACKEND", "").strip().lower()
+    if not _backend:
+        import token_manager as _tmb
+        # Testnet bật mà chưa chọn: dùng gateway — đường FLOP CÔNG BỐ. Scaffold mempool cũ không
+        # có endpoint thật nên quên đặt biến = cả ngày không chi gì. Đặt "mempool" để ép đường cũ.
+        _backend = "gateway" if _tmb.testnet_enabled() else "mempool"
+    if _sess_on and _backend == "gateway":
+        # Đường THẬT FLOP công bố: mua compute qua gateway api.flop.network (flop_gateway).
+        try:
+            session_status, _wd_settled, _wd_last = gateway_session_step(state, private_key, now)
+        except Exception as e:
+            session_status = "error"
+            print(f"[session] gateway bỏ qua ({str(e)[:100]})")
+    elif _sess_on:
         # Danh sách model_hash (CSV hoặc '|') -> mỗi phiên xoay 1 cái. Thiếu -> skip, KHÔNG bịa.
         # PHẢI import ở ĐẦU nhánh: resolve_model_hashes được gọi NGAY dưới đây, còn import
         # cũ nằm mãi trong nhánh else -> NameError làm sập cả run.
