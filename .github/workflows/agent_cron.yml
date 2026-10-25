@@ -144,7 +144,8 @@ jobs:
           # y như cũ. Đặt FLOP_KIBBLE_ENABLED=true để bật (bật thì DRY-RUN cho tới khi đặt
           # FLOP_KIBBLE_DRY_RUN=false). Types mặc định = explain,coordinate,summarize.
           FLOP_KIBBLE_ENABLED: ${{ vars.FLOP_KIBBLE_ENABLED }}
-          FLOP_KIBBLE_DRY_RUN: ${{ vars.FLOP_KIBBLE_DRY_RUN }}
+          # Fork này chạy kibble THẬT (chủ repo yêu cầu 2026-10-25). Muốn quay lại dry-run: đổi thành 'on'.
+          FLOP_KIBBLE_DRY_RUN: 'false'
           FLOP_KIBBLE_TYPES: ${{ vars.FLOP_KIBBLE_TYPES }}
           FLOP_KIBBLE_MAX_PER_RUN: ${{ vars.FLOP_KIBBLE_MAX_PER_RUN }}
           FLOP_KIBBLE_CLAIM: ${{ vars.FLOP_KIBBLE_CLAIM }}
