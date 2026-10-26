@@ -184,7 +184,8 @@ jobs:
           # FLOP_STATUS_FEED_ROOM đổi phòng đăng (mặc định = AGENT_ROOM); INTERVAL_HOURS mặc định 1.
           FLOP_STATUS_FEED_ENABLED: ${{ vars.FLOP_STATUS_FEED_ENABLED }}
           FLOP_STATUS_FEED_DRY_RUN: ${{ vars.FLOP_STATUS_FEED_DRY_RUN }}
-          FLOP_STATUS_FEED_INTERVAL_HOURS: ${{ vars.FLOP_STATUS_FEED_INTERVAL_HOURS }}
+          # Fork này: mặc định 4h. 1h = ~24 tin/ngày vào lobby (trần 20) -> chiếm hết chỗ của telemetry.
+          FLOP_STATUS_FEED_INTERVAL_HOURS: ${{ vars.FLOP_STATUS_FEED_INTERVAL_HOURS || '4' }}
           FLOP_STATUS_FEED_ROOM: ${{ vars.FLOP_STATUS_FEED_ROOM }}
           # Pacing/jitter đường ghi — rải các POST trong 1 run để đỡ đập trần rate-limit (429)
           # của technocore.chat. Mặc định BẬT nhẹ (600ms + jitter 400ms, retry 1 lần khi 429).
