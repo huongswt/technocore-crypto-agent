@@ -211,7 +211,7 @@ def network_matches(net: str, expect: str) -> bool:
     """`/health` có thể ghi "flop-testnet-1" thay vì đúng "testnet": khớp khi từ khoá nằm trong
     tên như một TỪ riêng (tách theo ký tự không phải chữ/số). "devnet" không bao giờ khớp
     "testnet" và ngược lại -> chi devnet không bao giờ bị ghi vào sổ testnet."""
-    net, expect = (net or "").strip().lower(), (expect or "").strip().lower()
+    net, expect = str(net or "").strip().lower(), str(expect or "").strip().lower()
     if not net or not expect:
         return False
     return net == expect or expect in re.split(r"[^a-z0-9]+", net)
@@ -290,9 +290,9 @@ def epoch_s(v):
     MỌI lượt. Giá trị > 1e11 coi là mili-giây, ngược lại là giây. Rỗng/rác -> None."""
     try:
         x = int(float(v))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):    # số khổng lồ/vô cực từ phản hồi lạ
         return None
-    if x <= 0:
+    if x <= 0 or x > 10**16:                           # quá năm ~2286 (ms) = rác, không phải hạn
         return None
     return x // 1000 if x > 10**11 else x
 
@@ -508,7 +508,8 @@ def report_line(g: dict, now: int):
 # --- một nhịp ---------------------------------------------------------------------------
 
 def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_network: str,
-             book_fn=None, sleep=time.sleep, log=print, rng=None) -> dict:
+             book_fn=None, sleep=time.sleep, log=print, rng=None, deadline=None,
+             clock=time.time) -> dict:
     """Một nhịp mua compute. Trả {"outcome", "calls", "spent", ...}; KHÔNG ném lỗi.
 
     `book_fn(amount, ref, model)` ghi sổ (chỉ khi mạng khớp `expect_network`); None = chạy
@@ -572,9 +573,17 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
         model_id = g.get("model")
         models = catalog(http, base)
         if model_id not in models:
-            # Key gắn với 1 model; model rời catalog -> không gửi slug không được quảng bá.
+            # Key gắn với 1 model; model rời catalog -> không gửi slug không được quảng bá. Bỏ
+            # bearer + model để lượt sau ĐĂNG KÝ LẠI: gateway có thể cấp model khác còn sống
+            # ("catalog drift may choose another compatible model"). Trước đây chỉ nghỉ 30
+            # phút rồi gặp lại đúng lỗi này -> kẹt mãi, không chi gì.
+            g.pop("vault", None)
+            g.pop("model", None)
+            g.pop("tok_cap", None)
+            g.pop("tok_bad", None)
             backoff(1800, "model_not_advertised")
-            return done("model_unavailable", reason=f"model {model_id} không còn trong catalog")
+            return done("model_unavailable",
+                        reason=f"model {model_id} không còn trong catalog — sẽ đăng ký lại ví ở lượt sau")
         model = models[model_id]
 
         def collect(prev_calls: int) -> dict:
@@ -686,6 +695,11 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
             else:
                 mt = size_cap if per_call >= preq + ptok * pp else None
             if mt is None:
+                break
+            # Ngân sách thời gian của LƯỢT (job GitHub bị giết ở 20 phút): không mở lần gọi mới
+            # nếu không kịp xong — phần đến hạn dồn sang lượt sau, không mất.
+            if deadline and clock() + (gap if calls else 0) + max_wait / 1000 + 15 > deadline:
+                log("[gateway] dừng lượt này: không đủ thời gian cho thêm một lần gọi (ngân sách lượt)")
                 break
             if calls:
                 sleep(gap)

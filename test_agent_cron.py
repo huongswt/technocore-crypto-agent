@@ -3748,6 +3748,14 @@ def test_new_settled_receipts_persist_the_ledger_immediately(monkeypatch):
     assert persisted == []                                              # không có gì mới -> không ghi KV thừa
 
 
+def test_run_deadline_only_applies_inside_main(monkeypatch):
+    monkeypatch.setattr(ac, "_RUN_STARTED", None)
+    assert ac.run_deadline() == float("inf")
+    monkeypatch.setattr(ac, "_RUN_STARTED", 1000.0)
+    monkeypatch.setenv("FLOP_RUN_BUDGET_SEC", "900")
+    assert ac.run_deadline() == 1900.0
+
+
 def test_faucet_claim_persists_the_ledger_immediately(monkeypatch, tmp_path):
     import flop_faucet
     monkeypatch.setenv("FLOP_FAUCET_STATE", str(tmp_path / "f.json"))
@@ -3785,3 +3793,17 @@ def test_operator_fallback_prompts_carry_live_market_context(monkeypatch):
     ac.gateway_session_step({"gateway_jobs": [{"id": "a", "task": "t1"}, {"id": "b", "task": "t2"}]},
                             _real_key(), 1_800_000_000)
     assert calls == []                                       # đủ job cho cả lượt -> không tốn lần lấy giá
+
+
+def test_faucet_waits_are_clamped_and_never_raise():
+    # Fuzz 2026-10-26: số khổng lồ -> OverflowError; "sau 999999 phút" -> hẹn ~2 năm = tắt faucet.
+    assert ac._faucet_retry_after(None, {"retry_after": "9" * 400}) in (None, ac.FAUCET_WAIT_MAX)
+    assert ac._faucet_retry_after(None, {"error": "try again in 999999 minutes"}, True) == ac.FAUCET_WAIT_MAX
+    assert ac._faucet_retry_after("3600", {}) == 3600                     # giá trị bình thường giữ nguyên
+    assert ac.scrub_links_and_addresses(None) is None
+
+
+def test_gateway_parsers_survive_hostile_values():
+    import flop_gateway as gw
+    assert gw.epoch_s("9" * 400) is None and gw.epoch_s(float("inf")) is None and gw.epoch_s(10**20) is None
+    assert gw.network_matches(-1, "testnet") is False and gw.network_matches(1.5, "testnet") is False
