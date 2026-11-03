@@ -74,13 +74,16 @@ def observe(state: dict, *, settled_onchain: int, status: str, spent_today_oncha
     # dưới) không khớp "pace-wait" -> mỗi lượt chờ bị đếm là "không chi" -> báo động GIẢ sau 6
     # lượt, lặp mỗi 6h. Coi là TRUNG TÍNH: không đếm lỗi, cũng KHÔNG xoá đếm — nếu settlement hỏng
     # thật, các lượt mua (chưa settle) xen giữa lượt chờ vẫn tích lại và báo động được.
-    if settled_onchain <= 0 and re.search(r"gateway/(pace_wait|exhausted)$", str(status)):
+    # daily_cap (phanh operator đặt) và attribution_hold (có Telegram riêng) cũng là trung tính.
+    if settled_onchain <= 0 and re.search(r"gateway/(pace_wait|exhausted|daily_cap|attribution_hold)$",
+                                          str(status)):
         return out
     if settled_onchain > 0 or healthy_wait:
         if w.get("alerted_ts") and settled_onchain > 0:
             mins = max(0, int((now - int(_num(w.get("since", now)))) / 60))
-            out["recovered"] = (f"✅ TESTNET: agent đã CHI THẬT lại (spent_onchain) sau khoảng "
-                                f"{mins} phút gián đoạn.")
+            # Gateway settle chưa chứng minh chi tiêu đứng tên ví; dòng "đứng tên ví" mới nói điều đó.
+            out["recovered"] = (f"✅ TESTNET: agent đã có phiên settle lại sau khoảng {mins} phút gián "
+                                "đoạn (chưa phải bằng chứng chain đã ghi cho ví mình).")
         state[KEY] = {}
         return out
     w["misses"] = int(_num(w.get("misses"))) + 1

@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Spend-path audit.** Gateway spend is no longer reported as on-chain or counted in the airdrop
+  metric until the explorer confirms it under the wallet (`gateway_settled_unverified`), and buying
+  stops after `FLOP_ATTRIB_GATE_MIN` FLOP unconfirmed. Failed runs keep their receipt results, so
+  miner stats and foreign-channel alerts are not lost and booked spend is persisted at once. A hung
+  request restored from KV is reconciled instead of dropped, a hung kibble job is not sent again,
+  and an empty catalog keeps the bearer. Malformed `usage` no longer loses a paid response; receipts
+  with only `settled_spend_raw` are booked; receipts that leave the response unsettled are counted.
+- Gemini empty replies fall back to the next provider; brief answers pass `guard_output`.
+- `import technocore_agent` crashed after `claim_mainnet_unlock` was removed; CI now imports the package.
+- Booked spend is saved before receipts are marked seen, so a run cancelled mid-call cannot lose it.
+- The attribution gate counts pending receipts and hung requests, caps each run by the room left, and
+  a small confirmed amount no longer opens it. The daily cap and the replay stop survive `state.json`
+  loss. A named network such as `flop-testnet-1` maps to the right explorer.
+- Gemini tries at most `GEMINI_MAX_TRIES` models per reply and respects the run budget; paid LLM calls
+  are capped by `FLOP_LLM_PAID_MAX_PER_DAY`.
+- The report no longer counts gateway calls as LLM metering and flags a ledger/chain balance gap; a
+  stale explorer balance is ignored; hydrate keeps the ledger with the most confirmed spend.
+- `TESTNET_ENABLED` with a non-testnet `FLOP_GATEWAY_NETWORK` refuses to buy.
+
+### Changed
+- `FLOP_GATEWAY_REPLAY_MAX` defaults to `0`. New hard caps `FLOP_GATEWAY_MAX_PER_RUN` (100) and
+  `FLOP_GATEWAY_MAX_PER_DAY` (2500). The mempool backend is refused on testnet.
+- `unlock_status()` returns `unlock_estimate` (reference only) instead of `unlocked_mainnet`,
+  `claimed_mainnet` and `claimable`: 3:1 unlocks the locked grant after genesis, not testnet spend.
+
+### Removed
+- **`token_manager.claim_mainnet_unlock()`** and `FLOP_MAINNET_CLAIM_URL`: nothing called them, and
+  the published design credits allocations at genesis with no claim step.
+- **`flop_stake.py` and `flop_units.py`** (and their tests) — neither was wired into the agent
+  (`agent_cron` never imported them; `FLOP_STAKE_ENABLED` was not mapped in the workflow). FLOP has
+  not published a staking API. Ledgers keep their `stake` key so any old delegated position is not
+  lost on hydrate. Breaking for SDK users who imported these modules directly.
+- **`agent_cron.get_prices()`** — unused back-compat wrapper; use `get_market(["bitcoin", "ethereum"])`.
+- **`deploy/GO-LIVE.md`** — mempool-era runbook superseded by STRATEGY.md's gateway day-one checklist.
+
+### Changed
+- Coverage now measures every shipped module (it skipped `flop_gateway`, `flop_session` and others);
+  `test_packaging` keeps the list in sync.
+
 ### Added
 - **Multi-room listen & respond (`AGENT_ROOMS`).** `auto_respond` can now listen and reply across
   a CSV list of rooms (e.g. `lobby,meta,flop`) in one run, each reply routed back to the room it
