@@ -306,6 +306,12 @@ def _pending(amount="30"):
     tm.record_gateway_spend(amount, "inference-session gateway m", "r-1")
 
 
+def _chain_read(raw, at=NOW):
+    """Số chi đứng tên ví trên explorer testnet, kèm mốc đọc (số không có mốc bị coi là cũ)."""
+    h = "explorer.testnet.flop.network"
+    return {"attr_spent_raw": {h: raw}, "attr_spent_at": {h: at}}
+
+
 def test_hold_stops_buying_but_keeps_reading_receipts(monkeypatch, telegram):
     _pending()
     st = fresh()
@@ -322,7 +328,7 @@ def test_hold_stops_buying_but_keeps_reading_receipts(monkeypatch, telegram):
 
 def test_hold_lifts_when_the_chain_shows_our_spend(monkeypatch, telegram):
     _pending()
-    st = {flop_radar.KEY: {"attr_spent_raw": {"explorer.testnet.flop.network": 30 * 10 ** 18}}}
+    st = {flop_radar.KEY: _chain_read(30 * 10 ** 18)}
     ac.gateway_attribution_step(st, NOW)
     assert ac.attribution_hold(st, NOW) is None
 
@@ -492,7 +498,7 @@ def test_foreign_channel_marker_is_durable():
 def test_tiny_confirmed_amount_does_not_open_the_gate(monkeypatch, telegram):
     _pending("500")
     monkeypatch.setattr(ac, "save_state", lambda d: None)
-    st = {flop_radar.KEY: {"attr_spent_raw": {"explorer.testnet.flop.network": 10 ** 16}}}
+    st = {flop_radar.KEY: _chain_read(10 ** 16)}
     assert ac.gateway_attribution_step(st, NOW) == "MISMATCH" and len(telegram) == 1
     assert "0.01" in ac.attribution_hold(st, NOW)
 
@@ -501,7 +507,7 @@ def test_large_confirmed_history_tolerates_explorer_lag():
     _pending("1000")
     tm.confirm_gateway_attribution("1000")
     tm.record_gateway_spend("50", "inference-session gateway m", "r-2")
-    st = {flop_radar.KEY: {"attr_spent_raw": {"explorer.testnet.flop.network": 1000 * 10 ** 18}}}
+    st = {flop_radar.KEY: _chain_read(1000 * 10 ** 18)}
     assert ac.attribution_hold(st, NOW) is None and ac.attribution_room(st, NOW) == pytest.approx(950)
 
 
@@ -547,8 +553,18 @@ def test_named_testnet_uses_the_testnet_explorer(monkeypatch):
     monkeypatch.setenv("FLOP_GATEWAY_NETWORK", "flop-testnet-1")
     assert ac._explorer_base("flop-testnet-1") == "https://explorer.testnet.flop.network"
     _pending()
-    st = {flop_radar.KEY: {"attr_spent_raw": {"explorer.testnet.flop.network": 30 * 10 ** 18}}}
+    st = {flop_radar.KEY: _chain_read(30 * 10 ** 18)}
     assert ac.onchain_spent(st, NOW) == 30
+
+
+def test_chain_reading_without_a_read_time_is_stale_not_fresh():
+    # Trước đây số không có mốc đọc được coi là vừa đọc -> xác nhận "đứng tên ví" bằng số không rõ tuổi.
+    _pending()
+    st = {flop_radar.KEY: {"attr_spent_raw": {"explorer.testnet.flop.network": 30 * 10 ** 18}}}
+    assert ac.onchain_spent(st, NOW) is None
+    assert ac.gateway_attribution_step(st, NOW) == "UNVERIFIED"
+    assert tm.gateway_attribution()["attributed"] == 0
+    assert ac.attribution_hold(st, NOW)                         # cổng vẫn đóng
 
 
 def test_report_does_not_count_gateway_calls_as_metering():
@@ -637,3 +653,69 @@ def test_paid_llm_calls_stop_at_the_daily_cap(monkeypatch):
     with pytest.raises(RuntimeError):
         ac._provider_reply("q", "s", 0.2)
     assert len(posts) == 1
+
+
+# --- báo cáo ngày + thống kê thợ đào bền -------------------------------------------------
+
+def _report(monkeypatch, tmp_path, telegram, mode_testnet, start=""):
+    import time as _t
+    if mode_testnet:
+        monkeypatch.setenv("TESTNET_ENABLED", "true")
+    else:
+        monkeypatch.delenv("TESTNET_ENABLED", raising=False)
+    monkeypatch.setenv("FLOP_TESTNET_START", start)
+    monkeypatch.setenv("TOKEN_LEDGER_FILE", str(tmp_path / f"r{mode_testnet}.json"))
+    monkeypatch.setattr(ac, "DAILY_REPORT_ENABLED", True)
+    tm.credit("100")
+    if mode_testnet:
+        tm.spend("3", "inference-session:a", submit_tx=lambda tx: {"tx_hash": "0x1"}, rpc="https://r.invalid",
+                 log=lambda m: None)
+    else:
+        tm.spend("3", "inference-session:a", log=lambda m: None)
+    assert ac.maybe_send_daily_report({}, int(_t.time()), extras={"kibble": "2✓ x", "session": "3✓", "thợ đào": "8"})
+    return telegram[-1]
+
+
+def test_report_in_simulation_has_no_day_count_and_names_fake_miners(monkeypatch, tmp_path, telegram):
+    txt = _report(monkeypatch, tmp_path, telegram, False, "2026-11-03")
+    assert "dự phóng" not in txt and "/90" not in txt
+    assert "thợ đào mô phỏng: 8" in txt and "phiên lượt cuối: 3✓" in txt and "kibble lượt cuối" in txt
+
+
+def test_report_projects_only_with_a_published_testnet_start(monkeypatch, tmp_path, telegram):
+    assert "dự phóng" not in _report(monkeypatch, tmp_path, telegram, True, "")
+    txt = _report(monkeypatch, tmp_path, telegram, True, "2026-01-01")
+    assert "dự phóng" in txt and "thợ đào: 8" in txt
+
+
+def test_miner_stats_come_back_from_signed_kv_after_state_loss(monkeypatch):
+    kv = {}
+    monkeypatch.setattr(ac, "kv_set", lambda pk, did, k, v: kv.update({k: v}) or True)
+    monkeypatch.setattr(ac, "kv_get", lambda k: kv.get(k))
+    monkeypatch.setattr(ac, "_miner_stats", {"counts": {"5Miner": 7}, "denied": 1})
+    ac.persist_miner_stats(KEY, "did")
+    assert ac.hydrate_miner_stats({}, KEY) == {"counts": {"5Miner": 7}, "denied": 1}
+    local = {ac._miner_stats_key(): {"counts": {"5Local": 2}}}
+    assert ac.hydrate_miner_stats(local, KEY) == local[ac._miner_stats_key()]    # state.json thắng
+
+
+def test_forged_miner_stats_on_kv_are_ignored(monkeypatch):
+    monkeypatch.setattr(ac, "kv_get", lambda k: json.dumps({"body": {"counts": {"x": 9}}, "sig": "AAAA"}))
+    assert ac.hydrate_miner_stats({}, KEY) == {}
+
+
+def test_miner_stats_are_trimmed_to_the_kv_limit(monkeypatch):
+    wrote = {}
+    monkeypatch.setattr(ac, "kv_set", lambda pk, did, k, v: wrote.update({k: v}) or True)
+    counts = {("5" + str(i).zfill(47)): i + 1 for i in range(200)}
+    monkeypatch.setattr(ac, "_miner_stats", {"counts": counts, "denied": 0})
+    ac.persist_miner_stats(KEY, "did")
+    sealed = wrote[ac._miner_stats_key()]
+    kept = json.loads(sealed)["body"]["counts"]
+    assert len(sealed) <= ac.KV_VALUE_MAX and 0 < len(kept) < 200 and max(counts.values()) in kept.values()
+
+
+def test_nothing_is_written_without_miner_stats(monkeypatch):
+    monkeypatch.setattr(ac, "kv_set", lambda *a, **k: pytest.fail("không có gì để ghi"))
+    monkeypatch.setattr(ac, "_miner_stats", {})
+    ac.persist_miner_stats(KEY, "did")

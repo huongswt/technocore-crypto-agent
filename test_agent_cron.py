@@ -1220,6 +1220,85 @@ def test_all_providers_dead_raises_instead_of_calling(monkeypatch):
         ac._provider_reply("q", "s", 0.2)
 
 
+def _resp_status_body(status, body):
+    """requests.Response thật: raise_for_status() ném HTTPError mang response (như API thật)."""
+    import requests
+    r = requests.Response()
+    r.status_code = status
+    r._content = body.encode("utf-8")
+    r.url = "https://example.invalid/"
+    return r
+
+
+def _http_error_body(status, body):
+    import requests
+    return requests.HTTPError(f"{status} Client Error", response=_resp_status_body(status, body))
+
+
+def test_key_rejected_only_when_the_body_speaks_about_the_key():
+    assert ac._key_rejected(_http_error(401)) == 401 and ac._key_rejected(_http_error(402)) == 402
+    gem = '{"error": {"code": 400, "message": "API key not valid. Please pass a valid API key.", ' \
+          '"status": "INVALID_ARGUMENT", "details": [{"reason": "API_KEY_INVALID"}]}}'
+    assert ac._key_rejected(_http_error_body(400, gem)) == 400
+    assert ac._key_rejected(_http_error_body(403, '{"error": {"status": "PERMISSION_DENIED"}}')) == 403
+    assert ac._key_rejected(_http_error_body(400, '{"error": "max_tokens too large"}')) == 0   # request sai
+    assert ac._key_rejected(_http_error(503)) == 0 and ac._key_rejected(ValueError("x")) == 0
+
+
+def test_gemini_rejected_key_is_dead_after_one_call(monkeypatch):
+    # Google trả 400 "API key not valid" (không phải 401): trước đây mỗi câu trả lời gõ 6 model Gemini
+    # rồi mới rơi sang DeepSeek trả phí, và lặp lại ở MỌI câu.
+    gem_calls = []
+    bad = '{"error": {"code": 400, "message": "API key not valid.", "status": "INVALID_ARGUMENT"}}'
+
+    def post(url, **k):
+        if "generativelanguage" in url:
+            gem_calls.append(url)
+            return _resp_status_body(400, bad)
+        return _resp_with_body({"choices": [{"message": {"content": "ok"}}]})
+    monkeypatch.setattr(ac.requests, "post", post)
+    monkeypatch.setattr(ac.requests, "get", lambda url, **k: _resp_status_body(400, bad))
+    monkeypatch.setattr(ac, "_provider_chain", lambda: ["gemini", "deepseek"])
+    monkeypatch.setattr(ac, "GEMINI_MODEL", "gemini-flash-lite-latest")
+    monkeypatch.setattr(ac, "_gemini_model_cache", None)
+    monkeypatch.setattr(ac, "_gemini_404", set())
+    monkeypatch.setattr(ac, "_gemini_429", {})
+    for _ in range(3):
+        assert ac._provider_reply("q", "s", 0.2)[1] == "deepseek"
+    assert len(gem_calls) == 1 and ac._llm_dead == {"gemini": 400}
+
+
+def test_groq_model_walk_is_capped(monkeypatch):
+    monkeypatch.setattr(ac, "_groq_model_cache", None)
+    monkeypatch.setattr(ac, "_groq_candidates", lambda: [f"m{i}" for i in range(40)])
+    calls = []
+    monkeypatch.setattr(ac, "_groq_call", lambda m, *a, **k: calls.append(m) or (_ for _ in ()).throw(
+        _http_error(503)))
+    with pytest.raises(Exception):
+        ac._groq_reply("q", "s", 0.2)
+    assert len(calls) == ac.GROQ_MAX_TRIES                     # trước đây: cả 40 model, mỗi cái tới 20s
+
+
+def test_groq_model_walk_respects_the_run_budget(monkeypatch):
+    monkeypatch.setattr(ac, "_groq_model_cache", None)
+    monkeypatch.setattr(ac, "_groq_candidates", lambda: ["m0", "m1"])
+    monkeypatch.setattr(ac, "run_deadline", lambda: ac.time.time() + 5)   # còn < 20s
+    monkeypatch.setattr(ac, "_groq_call", lambda *a, **k: pytest.fail("không được gọi khi hết ngân sách lượt"))
+    with pytest.raises(RuntimeError):
+        ac._groq_reply("q", "s", 0.2)
+
+
+def test_groq_rejected_key_stops_the_model_walk(monkeypatch):
+    monkeypatch.setattr(ac, "_groq_model_cache", None)
+    monkeypatch.setattr(ac, "_groq_candidates", lambda: ["m0", "m1", "m2"])
+    calls = []
+    monkeypatch.setattr(ac, "_groq_call", lambda m, *a, **k: calls.append(m) or (_ for _ in ()).throw(
+        _http_error(401)))
+    with pytest.raises(Exception):
+        ac._groq_reply("q", "s", 0.2)
+    assert calls == ["m0"]
+
+
 def test_provider_chain_pinned_without_key_is_empty(monkeypatch):
     _keys(monkeypatch, deepseek="dk", mode="gemini")   # ghim gemini nhưng thiếu key
     assert ac._provider_chain() == []
@@ -2803,7 +2882,7 @@ def test_daily_report_compacts_only_the_kibble_extra(monkeypatch):
               "faucet": "off"}
     before = dict(extras)
     assert ac.maybe_send_daily_report({}, 1_790_000_000, extras=extras) is True
-    assert "kibble: 2\u2713 \u00b7 useful 57% \u00b7 lifetime 58% (n=48)" in sent[0]
+    assert "kibble lượt cuối: 2\u2713 \u00b7 useful 57% \u00b7 lifetime 58% (n=48)" in sent[0]
     assert "pending=223" not in sent[0]
     assert "faucet: off" in sent[0]
     assert extras == before                      # không sửa dict của caller
@@ -3075,11 +3154,11 @@ def test_mempool_adapter_reports_real_field_names(monkeypatch):
     assert out["_raw_keys"] == ["channel", "miner", "sessionId"]
 
 
-def test_faucet_adapter_warns_when_amount_field_missing(monkeypatch, capsys):
+def test_faucet_adapter_does_not_substitute_the_requested_amount(monkeypatch, capsys):
     monkeypatch.setattr(ac.requests, "post", lambda *a, **k: _resp_with_body({"tx": "0xabc"}))
     out = ac._faucet_claim_fn({"faucet_url": "http://f", "signed": {}, "amount": "100"})
-    assert out["amount"] == "100"
-    assert "không có trường số lượng" in capsys.readouterr().out
+    assert out["amount"] is None                          # không phải "100" (lượng xin, không phải lượng nhận)
+    assert "KHÔNG ghi sổ" in capsys.readouterr().out
 
 
 # --- workflow_dispatch KHÔNG có nghĩa là "chạy tay": cron-job.org cũng dispatch -------------
@@ -3255,8 +3334,66 @@ def test_radar_step_keeps_alert_when_telegram_fails(monkeypatch):
 
 def test_radar_step_off_and_durable(monkeypatch):
     monkeypatch.setattr(ac, "TESTNET_RADAR", False)
+    monkeypatch.delenv("TESTNET_ENABLED", raising=False)
     assert ac.testnet_radar_step({}, 1) == "off"
     assert "last_radar" in ac._TS_DURABLE_KEYS and "testnet_radar" in ac._BLOB_DURABLE_KEYS
+    assert "last_attrib_read" in ac._TS_DURABLE_KEYS
+
+
+_TN = "https://explorer.testnet.flop.network"
+
+
+def _wallet_pages(spent_raw, balance_raw=25 * 10 ** 18):
+    def fetch(url):
+        if url.endswith("/inference-spend"):
+            return json.dumps({"totalSpentRaw": str(spent_raw)})
+        if "/api/accounts/" in url:
+            return json.dumps({"balance": str(balance_raw)})
+        return None
+    return fetch
+
+
+def test_radar_keeps_wallet_readings_when_telegram_fails(monkeypatch):
+    # Telegram hỏng trước đây hoàn TOÀN BỘ state radar -> số đọc của ví cũ quá 6h -> cổng đứng tên
+    # dừng mua, và tin "đã dừng mua" cũng đi qua Telegram nên không ai biết.
+    import flop_radar
+    monkeypatch.setattr(ac, "TESTNET_RADAR", True)
+    monkeypatch.setattr(ac, "_radar_wallet", lambda pk: "5Wallet")
+    monkeypatch.setattr(ac, "_radar_explorers", lambda: (_TN,))
+    monkeypatch.setattr(ac, "gateway_attribution_step", lambda st, now: "ok")
+    real_check = flop_radar.check
+    monkeypatch.setattr(flop_radar, "check", lambda st, f, **k: real_check(st, f, **k) or "🚨 x")
+    monkeypatch.setattr(ac, "_radar_fetch", _wallet_pages(3 * 10 ** 18))
+    saved = {}
+    monkeypatch.setattr(ac, "save_state", lambda d: saved.update(d))
+    monkeypatch.setattr(ac, "_telegram_send", lambda t: False)
+    st = {flop_radar.KEY: {"status": "planned"}}
+    assert ac.testnet_radar_step(st, 10_000) == "alert-unsent"
+    r = st[flop_radar.KEY]
+    h = "explorer.testnet.flop.network"
+    assert r["attr_spent_raw"][h] == 3 * 10 ** 18 and r["attr_spent_at"][h] > 0      # số đọc được GIỮ
+    assert r["status"] == "planned" and "attr_spent" not in r      # phần còn lại hoàn về: lần sau báo lại
+    assert "last_radar" not in saved and saved[flop_radar.KEY] is r
+
+
+def test_radar_off_still_reads_the_wallet_on_testnet(monkeypatch, tmp_path):
+    import flop_radar
+    monkeypatch.setattr(ac, "TESTNET_RADAR", False)
+    monkeypatch.setenv("TESTNET_ENABLED", "true")
+    monkeypatch.setenv("TOKEN_LEDGER_FILE", str(tmp_path / "ledger.json"))
+    monkeypatch.setattr(ac, "_radar_wallet", lambda pk: "5Wallet")
+    monkeypatch.setattr(ac, "_radar_explorers", lambda: (_TN,))
+    fetched = []
+    pages = _wallet_pages(0)
+    monkeypatch.setattr(ac, "_radar_fetch", lambda u: fetched.append(u) or pages(u))
+    monkeypatch.setattr(ac, "save_state", lambda d: None)
+    monkeypatch.setattr(ac, "_telegram_send", lambda t: True)
+    st = {}
+    assert ac.testnet_radar_step(st, 1_800_000_000) == "off+attrib"
+    assert fetched and all("/api/accounts/5Wallet" in u for u in fetched)   # chỉ đọc ví, không canh docs/issue
+    read_at = st[flop_radar.KEY]["attr_spent_at"]["explorer.testnet.flop.network"]   # giờ đọc thật
+    assert ac.chain_balance(st, read_at) == 25 and ac.onchain_spent(st, read_at) == 0
+    assert ac.testnet_radar_step(st, 1_800_000_060) == "off+attrib-skip"     # cùng nhịp radar
 
 
 # --- faucet: trạng thái phải sống qua run (runner mới = file trống) ------------------------
@@ -3738,7 +3875,9 @@ def test_durable_inflight_copy_never_carries_the_prompt(monkeypatch):
     monkeypatch.delenv("TESTNET_ENABLED", raising=False)
     st = {}
     ac.gateway_session_step(st, _real_key(), 1_800_000_000)
-    assert st["gateway_inflight"]["inflight"] == {"key": "k-1", "ts": 5, "max_cost": 1.0}
+    # Không có đề bài; có model/max_wait để vẫn đối soát được theo giờ gửi khi mất state.json.
+    assert st["gateway_inflight"]["inflight"] == {"key": "k-1", "ts": 5, "max_cost": 1.0, "model": "m",
+                                                  "max_wait": 1000}
 
 
 def test_cleared_inflight_in_state_json_wins_over_a_stale_kv_copy(monkeypatch):
@@ -3776,7 +3915,8 @@ def test_attribution_mismatch_alerts_once_a_day(monkeypatch, tmp_path):
     sent = []
     monkeypatch.setattr(ac, "_telegram_send", lambda m: sent.append(m) or True)
     monkeypatch.setattr(ac, "save_state", lambda d: None)
-    st = {flop_radar.KEY: {"attr_spent_raw": {"explorer.testnet.flop.network": 0}}}
+    h = "explorer.testnet.flop.network"
+    st = {flop_radar.KEY: {"attr_spent_raw": {h: 0}, "attr_spent_at": {h: 1_800_000_000}}}
     assert ac.gateway_attribution_step(st, 1_800_000_000) == "MISMATCH"
     assert ac.gateway_attribution_step(st, 1_800_000_600) == "ok"           # đã báo trong 24h
     assert len(sent) == 1 and "broker" in sent[0]
@@ -3786,7 +3926,8 @@ def test_attribution_confirmed_onchain_unlocks_and_stays_quiet(monkeypatch, tmp_
     import flop_radar
     tm = _testnet_ledger(monkeypatch, tmp_path, gateway_spend=30)
     monkeypatch.setattr(ac, "_telegram_send", lambda m: pytest.fail("không được báo"))
-    st = {flop_radar.KEY: {"attr_spent_raw": {"explorer.testnet.flop.network": 12 * 10 ** 18}}}
+    h = "explorer.testnet.flop.network"
+    st = {flop_radar.KEY: {"attr_spent_raw": {h: 12 * 10 ** 18}, "attr_spent_at": {h: 1_800_000_000}}}
     assert ac.gateway_attribution_step(st, 1_800_000_000) == "ok"
     assert tm.unlock_status()["spent_testnet"] == "12"
 

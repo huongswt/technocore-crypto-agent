@@ -1215,35 +1215,83 @@ def _radar_fetch(url: str):
     except requests.RequestException:
         return None
 
+def _radar_wallet(private_key):
+    """Địa chỉ SS58 của ví FLOP (ví gateway) để đọc trên explorer; None nếu chưa có ví."""
+    if private_key is None:
+        return None
+    try:
+        import flop_gateway
+        _wk = flop_gateway.wallet_key(private_key)
+        return flop_gateway.wallet_address(_wk) if _wk else None
+    except Exception:
+        return None
+
+
+def _radar_explorers() -> tuple:
+    import flop_radar
+    explorers = flop_radar.EXPLORERS
+    if RADAR_EXPLORER.startswith("https://") and RADAR_EXPLORER not in explorers:
+        explorers = explorers + (RADAR_EXPLORER,)
+    return explorers
+
+
+def attribution_read_step(state: dict, now: int, private_key=None) -> str:
+    """Radar TẮT (FLOP_TESTNET_RADAR=off) mà đang testnet: cổng đứng tên (attribution_room) vẫn cần số
+    chi/số dư của ví trên explorer — không có thì số cũ quá 6 giờ và agent ngừng mua mà không rõ vì
+    sao. Chỉ đọc 2 endpoint của ví, cùng nhịp radar; không canh issue/docs. Không ném lỗi."""
+    import token_manager as _tm
+    if not _tm.testnet_enabled():
+        return "off"
+    if not _due(state, "last_attrib_read", TESTNET_RADAR_H, now):
+        return "off+attrib-skip"
+    try:
+        import flop_radar
+        wallet = _radar_wallet(private_key)
+        if not wallet:
+            return "off"
+        r = dict(state.get(flop_radar.KEY) or {})
+        lines = flop_radar.read_wallet(r, _radar_fetch, wallet, _radar_explorers())
+        state[flop_radar.KEY] = r
+        _ab = gateway_attribution_step(state, now)
+        if _ab not in ("off", "ok"):
+            print(f"[attrib] {_ab}")
+        if lines:
+            msg = "🚨 FLOP — ví đứng tên:\n" + "\n".join(lines)
+            print(f"[attrib] {msg}")
+            _telegram_send(msg)
+        save_state({"last_attrib_read": now, flop_radar.KEY: r})
+        state["last_attrib_read"] = now
+        return "off+attrib"
+    except Exception as e:
+        print(f"[attrib] đọc ví bỏ qua ({str(e)[:80]})")
+        return "error"
+
+
 def testnet_radar_step(state: dict, now: int, private_key=None) -> str:
     """Một nhịp radar testnet (xem flop_radar). Trả trạng thái cho dòng [run]. Gửi Telegram
-    thất bại thì KHÔNG ghi nhận "đã thấy" và KHÔNG đóng cổng giờ -> lần sau báo lại."""
+    thất bại thì KHÔNG ghi nhận "đã thấy" và KHÔNG đóng cổng giờ -> lần sau báo lại — nhưng số
+    đọc được của ví vẫn được GIỮ (cổng đứng tên dựa vào nó; Telegram hỏng không được làm agent
+    ngừng mua). Radar tắt -> chỉ đọc ví (attribution_read_step)."""
     if not TESTNET_RADAR:
-        return "off"
+        return attribution_read_step(state, now, private_key)
     if not _due(state, "last_radar", TESTNET_RADAR_H, now):
         return "skip"
     try:
         import flop_radar
         prev = state.get(flop_radar.KEY)
-        wallet = None
-        if private_key is not None:
-            try:
-                import flop_gateway
-                _wk = flop_gateway.wallet_key(private_key)
-                wallet = flop_gateway.wallet_address(_wk) if _wk else None
-            except Exception:
-                wallet = None
-        explorers = flop_radar.EXPLORERS
-        if RADAR_EXPLORER.startswith("https://") and RADAR_EXPLORER not in explorers:
-            explorers = explorers + (RADAR_EXPLORER,)
-        alert = flop_radar.check(state, _radar_fetch, wallet=wallet, explorers=explorers)
+        alert = flop_radar.check(state, _radar_fetch, wallet=_radar_wallet(private_key),
+                                 explorers=_radar_explorers())
         _ab = gateway_attribution_step(state, now)
         if _ab not in ("off", "ok"):
             print(f"[attrib] {_ab}")
         if alert:
             print(f"[radar] {alert}")
             if not _telegram_send(alert):
-                state[flop_radar.KEY] = prev
+                new = state.get(flop_radar.KEY) or {}
+                keep = {k: new[k] for k in flop_radar.WALLET_READ_KEYS if new.get(k)}
+                state[flop_radar.KEY] = {**(prev or {}), **keep} if keep else prev
+                if keep:
+                    save_state({flop_radar.KEY: state[flop_radar.KEY]})
                 return "alert-unsent"
         save_state({"last_radar": now, flop_radar.KEY: state.get(flop_radar.KEY)})
         state["last_radar"] = now
@@ -1612,7 +1660,7 @@ def primary_alive(now: int, within_min: float, private_key=None) -> bool:
 _TS_DURABLE_KEYS = ("last_seq", "last_telemetry", "last_manifest", "last_digest",
                     "last_status_feed", "last_recap", "last_weekly_sample",
                     "last_daily_report", "last_radar", "last_state_loss_alert",
-                    "gateway_foreign_seen")
+                    "gateway_foreign_seen", "last_attrib_read")
 # gateway_inflight: request gateway đang treo (timeout/5xx mơ hồ) + trần ngày + cờ cấm phát lại — mất
 # Actions cache vẫn đối soát được và không tự đặt lại phanh an toàn.
 _BLOB_DURABLE_KEYS = ("weekly_samples", "last_alert_price", "testnet_radar", "gateway_inflight", "llm_paid")
@@ -1913,14 +1961,46 @@ def maybe_send_daily_report(state: dict, now: int, extras: dict = None) -> bool:
             _start = os.environ.get("FLOP_TESTNET_START", "").strip()
             if _start:
                 _led["testnet_start"] = _start
-            proj = fr.projection(_led, now,
-                                 token=token_manager.default_token(), horizon_days=_days)
+            # Chỉ dự phóng khi kỳ testnet đã có mốc: đếm từ lần chi mô phỏng đầu tiên thì "ngày 16/90"
+            # là một kỳ không tồn tại.
+            proj = (fr.projection(_led, now, token=token_manager.default_token(), horizon_days=_days)
+                    if _start and token_manager.testnet_enabled() else None)
         except Exception:
             proj = None
+        # kibble/session là trạng thái của LƯỢT CUỐI, không phải tổng ngày.
+        _labels = {"kibble": "kibble lượt cuối", "session": "phiên lượt cuối"}
+        if not token_manager.testnet_enabled():
+            _labels["thợ đào"] = "thợ đào mô phỏng"
+        extras = {_labels.get(k, k): v for k, v in extras.items()}
         return _telegram_send(fr.format_report(summ, extras=extras, pacing=pacing, proj=proj))
     except Exception as e:
         print(f"[report] bỏ qua ({str(e)[:100]})")
         return False
+
+
+def persist_miner_stats(private_key, did) -> None:
+    """Đẩy thống kê thợ đào lên khoá KV ĐÃ KÝ riêng. Tách khỏi `state`: tới MINER_CAP thợ đào có thể
+    vượt KV_VALUE_MAX, và một lần ghi bị từ chối sẽ làm mất mọi khoá bền khác. Quá trần -> giữ các
+    thợ đào nhiều phiên nhất."""
+    import flop_miners
+    st = flop_miners._clean(_miner_stats)
+    if not st["counts"]:
+        return
+    top = sorted(st["counts"].items(), key=lambda kv: -kv[1])
+    for cap in (len(top), 100, 50, 20):
+        sealed = _kv_seal(private_key, {"counts": dict(top[:cap]), "denied": st["denied"]})
+        if len(sealed) <= KV_VALUE_MAX:
+            kv_set(private_key, did, _miner_stats_key(), sealed)
+            return
+
+
+def hydrate_miner_stats(state: dict, private_key=None) -> dict:
+    """Thống kê thợ đào từ state.json; mất state.json thì lấy bản KV đã ký của chính agent."""
+    local = state.get(_miner_stats_key())
+    if local:
+        return local
+    body = _kv_open(kv_get(_miner_stats_key()), private_key)
+    return body if isinstance(body, dict) else {}
 
 
 def persist_ledger_to_kv(private_key, did) -> None:
@@ -2176,7 +2256,30 @@ def _one_reply(provider: str, user_text: str, system: str, temperature: float,
 # Provider trả 401/402 (key sai / hết tiền) = hỏng HẲN, không phải lỗi tạm: bỏ qua tới hết lượt
 # chạy này thay vì gọi lại ở MỌI lần cần LLM. Một lượt = một tiến trình, nên tự xoá ở lượt sau.
 _LLM_DEAD_STATUS = (401, 402)
+# Google trả 400 INVALID_ARGUMENT ("API key not valid") / 403 PERMISSION_DENIED cho KHOÁ hỏng — không
+# phải 401. Không nhận ra thì mỗi câu trả lời lại gõ tới GEMINI_MAX_TRIES model rồi mới rơi xuống
+# provider trả phí. Chỉ coi 400/403 là khoá hỏng khi thân lỗi NÓI về khoá (400 thường = request sai).
+_KEY_REJECTED_MARKERS = ("api key not valid", "api_key_invalid", "invalid api key", "api key expired",
+                         "api_key_expired", "permission_denied", "consumer_suspended",
+                         "has been suspended", "incorrect api key")
 _llm_dead = {}                       # provider -> mã HTTP đã khiến nó bị bỏ qua
+
+
+def _key_rejected(e) -> int:
+    """Mã HTTP nếu lỗi `e` cho thấy KHOÁ API hỏng hẳn (401/402, hoặc 400/403 kèm thông báo về khoá),
+    ngược lại 0."""
+    resp = getattr(e, "response", None)
+    status = getattr(resp, "status_code", None)
+    if status in _LLM_DEAD_STATUS:
+        return status
+    if status in (400, 403):
+        try:
+            body = str(getattr(resp, "text", "") or "")
+        except Exception:
+            body = ""
+        if any(m in f"{body} {e}".lower() for m in _KEY_REJECTED_MARKERS):
+            return status
+    return 0
 # Provider TÍNH TIỀN theo lượt gọi: khi provider miễn phí hỏng cả ngày, mọi lượt đổ sang đây.
 _LLM_PAID = ("deepseek", "openai")
 _llm_paid = {}                       # {"day": 'YYYY-MM-DD', "n": số lần gọi}, bền qua state
@@ -2220,10 +2323,10 @@ def _provider_reply(user_text: str, system: str, temperature: float, max_tokens:
         except Exception as e:
             last_err = e
             print(f"[llm:{provider}] failed | {str(e)[:100]}")
-            status = getattr(getattr(e, "response", None), "status_code", None)
-            if status in _LLM_DEAD_STATUS:
+            status = _key_rejected(e)
+            if status:
                 _llm_dead[provider] = status
-                print(f"[llm:{provider}] HTTP {status} — bỏ qua provider này tới hết lượt chạy")
+                print(f"[llm:{provider}] HTTP {status} (khoá bị từ chối) — bỏ qua provider này tới hết lượt chạy")
     raise last_err or RuntimeError("no llm provider available")
 
 
@@ -2251,6 +2354,7 @@ GEMINI_LAST_GOOD_TTL_SEC = int(_env_float("GEMINI_LAST_GOOD_TTL_SEC", 3600))
 # Mỗi model treo mất tới 20s và key có thể có hàng chục model: một câu trả lời không được phép ăn
 # hết ngân sách của cả lượt khi Google chập chờn.
 GEMINI_MAX_TRIES = int(_env_float("GEMINI_MAX_TRIES", 6))
+GROQ_MAX_TRIES = int(_env_float("GROQ_MAX_TRIES", 6))       # cùng lý do cho vòng dò model Groq
 _gemini_last_good_ts = None          # lúc model trong cache được xác nhận chạy (epoch)
 
 
@@ -2415,6 +2519,8 @@ def _gemini_reply(user_text: str, system: str, temperature: float,
             _gemini_note_429(_gemini_model_cache, e)
             _gemini_model_cache = None
             _gemini_last_good_ts = None
+            if _key_rejected(e):
+                raise                            # khoá hỏng: model khác cũng vậy, không thử tiếp
 
     # 2) Lùi về danh sách ưu tiên (áp dụng cả khi user ghim GEMINI_MODEL nhưng nó fail).
     for model in _gemini_candidates():
@@ -2435,6 +2541,8 @@ def _gemini_reply(user_text: str, system: str, temperature: float,
             tried.add(model)
             _gemini_note_404(model, e)
             _gemini_note_429(model, e)
+            if _key_rejected(e):
+                raise                            # khoá hỏng: model khác cũng vậy, không thử tiếp
     raise last_err or RuntimeError("no gemini model available")
 
 
@@ -2528,11 +2636,18 @@ def _groq_reply(user_text: str, system: str, temperature: float,
             print(f"[llm:groq] cached {_groq_model_cache} -> {str(e)[:80]}, fallback")
             tried.add(_groq_model_cache)
             _groq_model_cache = None
+            if _key_rejected(e):
+                raise                            # khoá hỏng: model khác cũng vậy, không thử tiếp
 
-    # 2) Lùi về danh sách ưu tiên (áp dụng cả khi user ghim GROQ_MODEL nhưng nó fail).
+    # 2) Lùi về danh sách ưu tiên (áp dụng cả khi user ghim GROQ_MODEL nhưng nó fail). Có TRẦN lượt
+    #    thử và tôn trọng ngân sách lượt như Gemini: key Groq liệt kê hàng chục model, mỗi lần treo tới
+    #    20s — trước đây không trần, có thể đẩy lượt chạy quá timeout-minutes 20 của job.
     for model in _groq_candidates():
         if model in tried:
             continue
+        if len(tried) >= GROQ_MAX_TRIES or time.time() + 20 > run_deadline():
+            print(f"[llm:groq] dừng sau {len(tried)} model (trần lượt thử / ngân sách lượt)")
+            break
         try:
             text = _groq_call(model, user_text, system, temperature, max_tokens)
             print(f"[llm:groq] model = {model}")
@@ -2542,6 +2657,8 @@ def _groq_reply(user_text: str, system: str, temperature: float,
             last_err = e
             print(f"[llm:groq] {model} -> {str(e)[:80]}")
             tried.add(model)
+            if _key_rejected(e):
+                raise                            # khoá hỏng: model khác cũng vậy, không thử tiếp
     raise last_err or RuntimeError("no groq model available")
 
 
@@ -3426,10 +3543,10 @@ def _faucet_claim_fn(req: dict) -> dict:
     # "thiếu trường" -> trước đây rơi về lượng XIN và ghi khống vào sổ.
     amt = next((data[k] for k in ("amount", "granted", "value") if data.get(k) is not None), None)
     if amt is None:
-        # Ghi theo lượng XIN là đoán: sổ có thể lệch số dư thật trên chain. Báo to + in khoá.
-        print(f"[faucet] ⚠️ phản hồi không có trường số lượng — tạm ghi theo yêu cầu "
+        # KHÔNG ghi theo lượng XIN (FLOP_FAUCET_AMOUNT mặc định 100, mức quick thật là 25): sổ sẽ có
+        # FLOP không tồn tại. Lần claim vẫn được tính; số dư thật lấy từ chain (dòng báo cáo).
+        print(f"[faucet] ⚠️ phản hồi không có trường số lượng — KHÔNG ghi sổ, đối chiếu số dư trên chain "
               f"(keys: {sorted(data)[:15]})")
-        amt = req.get("amount")
     out = {"amount": amt}
     if flop_format and data.get("txHash"):
         out["tx"] = str(data["txHash"])[:80]
@@ -4472,7 +4589,9 @@ FOREIGN_SEEN_KEY = "gateway_foreign_seen"
 
 
 def onchain_spent(state: dict, now: int):
-    """Chi tiêu đứng tên ví mình trên explorer đúng mạng (FLOP), đọc còn mới; None nếu không biết."""
+    """Chi tiêu đứng tên ví mình trên explorer đúng mạng (FLOP), đọc còn mới; None nếu không biết.
+    Số KHÔNG có mốc đọc (bản radar cũ, bản ghi hỏng) là cũ — như chain_balance: xác nhận "đứng tên ví
+    mình" từ một số không biết đọc lúc nào sẽ mở cổng mua bằng bằng chứng hết hạn."""
     import flop_radar
     from decimal import Decimal
     net = _attrib_net()
@@ -4481,7 +4600,7 @@ def onchain_spent(state: dict, now: int):
     at = r.get("attr_spent_at") or {}
     seen = [v for h, v in (r.get("attr_spent_raw") or {}).items()
             if isinstance(v, int) and (h == own or f".{net}." in h)
-            and now - int(at.get(h) or now) <= ATTRIB_FRESH_SEC]
+            and now - int(at.get(h) or 0) <= ATTRIB_FRESH_SEC]
     return Decimal(max(seen)) / Decimal(10 ** 18) if seen else None
 
 
@@ -4762,7 +4881,9 @@ def gateway_session_step(state: dict, private_key, now: int):
     # KV công khai và giới hạn 8192 ký tự: chỉ sao khoá đối soát, KHÔNG sao đề bài. Mất state.json
     # thì đối soát theo biên nhận, không phát lại được.
     _inf = _g.get("inflight") if isinstance(_g.get("inflight"), dict) else None
-    state["gateway_inflight"] = {"inflight": _inf and {k: _inf.get(k) for k in ("key", "ts", "max_cost")},
+    state["gateway_inflight"] = {"inflight": _inf and {k: _inf[k] for k in ("key", "ts", "sent", "max_cost",
+                                                                            "model", "max_wait")
+                                                       if _inf.get(k) is not None},
                                  "profile": _g.get("profile"), "at": now, "day_spent": _g.get("day_spent"),
                                  "replay_unsafe": _g.get("replay_unsafe")}
     save_state({"gateway_inflight": state["gateway_inflight"]})
@@ -4919,7 +5040,7 @@ def main():
     # Độ phân tán thợ đào: bằng chứng "independent demand" chỉ có giá trị khi tích luỹ
     # qua nhiều ngày, nên phải bền qua run.
     _miner_stats.clear()
-    _miner_stats.update(state.get(_miner_stats_key()) or {})
+    _miner_stats.update(hydrate_miner_stats(state, private_key))
     now = int(time.time())
     force = force_broadcast_requested()
 
@@ -5576,6 +5697,7 @@ def main():
     # kiểm tra outage để 1 lần kv_set thành công ở đây không che giấu outage thật.
     persist_durable_to_kv(private_key, did)
     persist_ledger_to_kv(private_key, did)   # đẩy sổ cái token (metering) lên KV -> bền, đo được
+    persist_miner_stats(private_key, did)
     # Báo cáo chi tiêu định kỳ (GATED) — đặt SAU persist để số liệu đã chốt của run này.
     _mx = {"kibble": kibble_status, "faucet": faucet_status, "session": session_status}
     # Dấu chân công khai (chỉ khi SẮP gửi báo cáo -> không tốn request mỗi run): tin/phòng hôm
