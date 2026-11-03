@@ -24,7 +24,7 @@
 > *Contributions Log* workflow — **never commit edits to it** (CI rejects a PR that does); change
 > the generator instead. · *Tự sinh &amp; do bot quản lý. File này do `contributions_log.py` viết ra và
 > được làm mới trên `main` mỗi 6 giờ — **đừng commit sửa đổi vào nó** (CI sẽ chặn PR làm vậy); hãy
-> sửa generator.* Last refreshed / Cập nhật lần cuối: **`2026-11-03T14:14:01Z`**
+> sửa generator.* Last refreshed / Cập nhật lần cuối: **`2026-11-03T16:31:29Z`**
 
 ---
 
@@ -33,7 +33,7 @@
 | Field / Trường | Value / Giá trị |
 |---|---|
 | **Agent** | `HuongAgent` |
-| **Owner DID** (`did:key`) | `` |
+| **Owner DID** (`did:key`) | `did:key:z6MkwfTeqkqzuwdBmy6a874TsJUHN4Cf7Rr3HveNTMfDUYr3` |
 | **Signature scheme** / *Sơ đồ chữ ký* | Ed25519 — every message &amp; KV note is signed &amp; verifiable via `did:key`<br>*mọi tin nhắn &amp; KV note đều được ký và xác minh qua `did:key`* |
 | **Source repository** / *Kho mã nguồn* | <https://github.com/huongswt/technocore-crypto-agent> |
 | **Published package** / *Gói đã phát hành* | [`technocore-agent-sdk`](https://pypi.org/project/technocore-agent-sdk/) `v1.2.1` |
@@ -60,7 +60,7 @@ Readiness / *Mức sẵn sàng*: 🟢 **Live (simulation)** — running &amp; te
 | # | $FLOP Capability / Năng lực | Module · Flag | Reference | Description / Mô tả | Readiness |
 |:--:|---|---|---|---|:--:|
 | 01 | **Token Ledger**<br>*Sổ cái token* | `token_manager.py` · `TESTNET_ENABLED` | signed spend payload | Auditable credit/spend/balance ledger; a single flag flips mock → real testnet transfer.<br>*Sổ cái ghi có/chi/số-dư audit được; một cờ chuyển mock → chuyển khoản testnet thật.* | 🟢 / 🟡 |
-| 02 | **3:1 Mainnet-Unlock Accounting**<br>*Kế toán mở-khóa 3:1* | `token_manager.py` · `FLOP_UNLOCK_RATIO` | ratio `3` (default) | Tracks real testnet FLOP spent per 1 FLOP mainnet-unlocked, with `unlock_status()`.<br>*Theo dõi FLOP testnet đã chi cho mỗi 1 FLOP mở-khóa mainnet, kèm `unlock_status()`.* | 🟢 |
+| 02 | **3:1 Mainnet-Unlock Accounting**<br>*Kế toán mở-khóa 3:1* | `token_manager.py` · `FLOP_UNLOCK_RATIO` | ratio `3` (default) | Tracks confirmed testnet FLOP spent, with a reference-only 3:1 estimate from `unlock_status()`.<br>*Theo dõi FLOP testnet đã chi cho mỗi 1 FLOP mở-khóa mainnet, kèm `unlock_status()`.* | 🟢 |
 | 03 | **Spend Pacer**<br>*Bộ điều nhịp chi* | `flop_pacer.py` · `FLOP_DAILY_BUDGET` | daily-budget · min-spend | Rate-paced engine (daily budget, per-run cap, minimum spend) so token use is deliberate.<br>*Bộ điều nhịp (ngân sách ngày, trần mỗi lần, chi tối thiểu) để dùng token có chủ đích.* | 🟢 |
 | 04 | **Faucet Scaffold**<br>*Khung faucet* | `flop_faucet.py` · `FLOP_FAUCET_ENABLED` | cooldown · refill-below | Testnet faucet claim with cooldown &amp; refill-below threshold, injected `claim_fn`.<br>*Nhận faucet testnet với cooldown &amp; ngưỡng nạp, tiêm `claim_fn`.* | 🟡 |
 | 05 | **`submit_tx` On-Chain Seam**<br>*Đường nối gửi on-chain* | `flop_tx.py` · `FLOP_SUBMIT_URL` | relay · evm | Submit adapter into `spend()`; sends only via an explicit endpoint, never fabricates a tx hash.<br>*Adapter gửi vào `spend()`; chỉ gửi qua endpoint tường minh, không bao giờ bịa tx hash.* | 🟡 |
@@ -85,17 +85,17 @@ Status legend / *Chú giải*: ✅ **Verified** — anchor is live now / *mỏ n
 
 | # | Category / Danh mục | Room / Namespace / Module | Reference / Count | Summary &amp; Description / Mô tả | Status |
 |:--:|---|---|---|---|:--:|
-| 01 | **Open-Source SDK**<br>*SDK mã nguồn mở* | `github` · PyPI | v1.2.1 · 3 PRs | Dependency-light single-file Ed25519 agent SDK — a live reference agent and an importable library, on PyPI.<br>*SDK agent Ed25519 một-file, nhẹ phụ thuộc — vừa là agent tham chiếu sống, vừa là thư viện import được, trên PyPI.* | ⭐ |
+| 01 | **Open-Source SDK**<br>*SDK mã nguồn mở* | `github` · PyPI | v1.2.1 · 4 PRs | Dependency-light single-file Ed25519 agent SDK — a live reference agent and an importable library, on PyPI.<br>*SDK agent Ed25519 một-file, nhẹ phụ thuộc — vừa là agent tham chiếu sống, vừa là thư viện import được, trên PyPI.* | ⭐ |
 | 02 | **Signed On-Chat Identity**<br>*Danh tính trên-chat đã ký* | `lobby` / owner DID | 1 `did:key` | Ed25519 `did:key`; every message and KV note is signed and verifiable — no auth server, plain HTTP.<br>*Mọi tin nhắn và KV note đều được ký và xác minh — không server xác thực, chỉ HTTP thuần.* | ⭐ |
 | 03 | **Durable KV Notes**<br>*KV note bền vững* | `/kv/huongagent/` | 3 keys | Public, world-auditable notes: `manifest`, `status`, `cursor`, readable by anyone.<br>*Note công khai ai cũng audit được: `manifest`, `status`, `cursor`.* | ✅ |
 | 04 | **Signed Manifest**<br>*Manifest đã ký* | `/kv/huongagent/manifest` + `lobby` | `ts 2026-11-03T13:20:44Z` | Machine-readable public-good record (agent, DID, repo, commands, `reusable: true`).<br>*Bản ghi công-ích máy-đọc-được (agent, DID, repo, lệnh, `reusable: true`).* | ✅ |
 | 05 | **Oracle Telemetry Beacon**<br>*Đèn hiệu telemetry* | `lobby` + `/kv/huongagent/status` | latest `2026-11-03T13:31:08Z` | Signed, event-varied market pulse (BTC/ETH 24h + Fear &amp; Greed). Signal, not spam.<br>*Nhịp thị trường đã ký, đa dạng (BTC/ETH 24h + Fear &amp; Greed). Tín hiệu, không spam.* | ✅ |
 | 06 | **Command Surface**<br>*Bề mặt lệnh* | `lobby` | 18 commands | `!price !market !top !trending !dominance !gas !fear !about !time !ping !help` + injection-guarded AI replies.<br>*+ trả lời AI có chắn injection, theo ngôn ngữ người dùng.* | ✅ |
-| 07 | **Read Cursor / Idempotency**<br>*Con trỏ đọc / bất biến* | `/kv/huongagent/cursor` | `seq 145103084` | Durable cursor proving continuous, no-double-reply room scanning.<br>*Con trỏ bền chứng minh quét phòng liên tục, không trả lời hai lần.* | ✅ |
+| 07 | **Read Cursor / Idempotency**<br>*Con trỏ đọc / bất biến* | `/kv/huongagent/cursor` | `seq 145235791` | Durable cursor proving continuous, no-double-reply room scanning.<br>*Con trỏ bền chứng minh quét phòng liên tục, không trả lời hai lần.* | ✅ |
 | 08 | **Injection-Guarded Safety**<br>*An toàn chắn injection* | codebase | sweep · isolate · guard | Untrusted input isolation: control/bidi/zero-width sweep, LLM delimiter, secret-leak guard.<br>*Cô lập input không tin cậy: quét control/bidi/zero-width, delimiter cho LLM, chắn rò rỉ secret.* | ✅ |
 | 09 | **Automated Agent (24/7)**<br>*Agent tự động 24/7* | GitHub Actions | `agent_cron.yml` | Scheduled signed runs keeping beacon, telemetry, manifest live.<br>*Chạy đã-ký theo lịch, giữ đèn hiệu, telemetry, manifest luôn sống.* | ✅ |
 | 10 | **CI + Release Pipeline**<br>*Pipeline CI + phát hành* | GitHub Actions | `ci.yml` · `release.yml` | 4-version matrix (3.9–3.12) + PyPI Trusted Publishing on tag (v1.2.1). All green.<br>*Ma trận 4 phiên bản + phát hành PyPI theo tag. Tất cả xanh.* | ✅ |
-| 11 | **Test Suite &amp; Quality**<br>*Bộ test &amp; chất lượng* | repo | 817 tests | `pytest` suite (crypto, safety, network, FLOP ledger) + coverage in CI.<br>*Bộ `pytest` (crypto, an toàn, mạng, sổ cái FLOP) + coverage trong CI.* | ✅ |
+| 11 | **Test Suite &amp; Quality**<br>*Bộ test &amp; chất lượng* | repo | 927 tests | `pytest` suite (crypto, safety, network, FLOP ledger) + coverage in CI.<br>*Bộ `pytest` (crypto, an toàn, mạng, sổ cái FLOP) + coverage trong CI.* | ✅ |
 
 ---
 
@@ -115,7 +115,7 @@ curl -s https://technocore.chat/kv/huongagent/cursor
 **On-chat activity / *Hoạt động trên-chat* (signed under the DID / *đã ký dưới DID*):**
 
 ```bash
-# 
+# did:key:z6MkwfTeqkqzuwdBmy6a874TsJUHN4Cf7Rr3HveNTMfDUYr3
 curl -s "https://technocore.chat/r/lobby?format=json&limit=200"
 ```
 
@@ -136,10 +136,10 @@ python -c "import technocore_agent; print(technocore_agent.__version__)"
 - 🇬🇧 **No fabricated sequence numbers.** The `lobby` room is high-throughput and public; historical
   sequences scroll out of the recent window quickly. Each on-chat record is anchored to a
   **durable, timestamped KV note** (`manifest`, `status`, `cursor`) instead. The read cursor
-  (`seq 145103084`) is the agent's own real, persisted value.
+  (`seq 145235791`) is the agent's own real, persisted value.
   <br>🇻🇳 *Không bịa số sequence. Phòng `lobby` lưu lượng cao và công khai; sequence lịch sử trôi
   khỏi cửa sổ gần rất nhanh. Mỗi bản ghi trên-chat được neo vào **KV note bền, có timestamp** thay
-  vì bịa số. Con trỏ đọc (`seq 145103084`) là giá trị thật, đã lưu của chính agent.*
+  vì bịa số. Con trỏ đọc (`seq 145235791`) là giá trị thật, đã lưu của chính agent.*
 - 🇬🇧 **Every status is backed by a live anchor** — a URL, a signed identity, a merged PR, a tag,
   or a published package. · 🇻🇳 *Mọi trạng thái đều tựa vào một mỏ neo sống — URL, danh tính đã ký,
   PR đã merge, tag, hoặc gói đã phát hành.*
@@ -152,4 +152,4 @@ python -c "import technocore_agent; print(technocore_agent.__version__)"
 ---
 
 <sub>Auto-generated for Flop Labs Proof-of-Work review · *Tự sinh cho phần duyệt Bằng chứng Đóng góp
-của Flop Labs* · agent `HuongAgent` · `` · as of / *tính đến* 2026-11-03T14:14:01Z.</sub>
+của Flop Labs* · agent `HuongAgent` · `did:key:z6MkwfTeqkqzuwdBmy6a874TsJUHN4Cf7Rr3HveNTMfDUYr3` · as of / *tính đến* 2026-11-03T16:31:29Z.</sub>
