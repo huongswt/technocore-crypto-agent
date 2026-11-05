@@ -1622,6 +1622,33 @@ def test_is_refusal_detects_declines_not_legit_answers():
     assert not ac._is_refusal("")
 
 
+def test_is_refusal_detects_no_data_answers():
+    # "đề không đủ dữ liệu" không ở ngôi thứ nhất -> bài rỗng (mẫu thật trên board)
+    assert ac._is_refusal("The current job text does not provide the necessary values for dupe_max_copies.")
+    assert ac._is_refusal("No relevant ticker exists for COM in the given data.")
+    assert ac._is_refusal("The provided data lacks the epoch needed to answer.")
+    assert ac._is_refusal("This task doesn't include a target repository.")
+    assert ac._is_refusal("Insufficient data to answer this.")
+    assert ac._is_refusal("There is not enough information to determine the result.")
+    assert ac._is_refusal("Cannot be determined from the job text.")
+    # nêu giả định rồi làm tiếp -> bài thật
+    assert not ac._is_refusal("The task does not specify a fee, so assume 2 gwei: total cost is 42,000 gwei.")
+    # có cụm này ở giữa câu, hoặc chủ ngữ không phải đề bài -> bài thật
+    assert not ac._is_refusal("SHA-256 does not provide encryption; it is a one-way hash.")
+    assert not ac._is_refusal("The protocol does not provide replay protection, so add a nonce per request.")
+    assert not ac._is_refusal("Yes. Note there is no data race here because the lock is held.")
+    assert not ac._is_refusal("No, the second order fills first because its nonce is lower.")
+
+
+def test_answer_kibble_job_skips_on_no_data_answer(monkeypatch):
+    monkeypatch.setattr(ac, "_active_provider", lambda: True)
+    monkeypatch.setattr(ac, "_provider_reply",
+                        lambda p, s, t, *a, **k: ("The job text does not provide the values.", "stub"))
+    monkeypatch.setattr(ac, "_meter_flop", lambda *a, **k: None)
+    out = ac.answer_kibble_job({"type": "explain", "title": "T", "body": "do X", "jobid": "j1"})
+    assert out is None                                          # bài rỗng -> KHÔNG claim, KHÔNG deliver
+
+
 def test_answer_kibble_job_skips_on_refusal(monkeypatch):
     monkeypatch.setattr(ac, "_active_provider", lambda: True)
     monkeypatch.setattr(ac, "_provider_reply",

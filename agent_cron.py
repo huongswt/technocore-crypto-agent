@@ -2182,12 +2182,28 @@ _REFUSAL_MARKERS = (
     "sorry, i cannot", "sorry, i can't", "unable to comply", "unable to assist",
     "as an ai", "as a language model",
 )
+# Từ chối KHÔNG ở ngôi thứ nhất: "The job text does not provide...", "No relevant ticker exists",
+# "Insufficient data" -> bài rỗng, attestor chấm 'not'. Cũng chỉ khớp ở ĐẦU câu. Câu nêu GIẢ ĐỊNH
+# rồi làm tiếp ("The task does not specify X, so assume Y: ...") là bài thật, KIBBLE_SYSTEM dặn
+# làm vậy -> không chặn.
+_NO_DATA_RE = re.compile(
+    r"^(?:(?:the|this)\s+(?:(?:current|provided|given|job|task)\s+)*"
+    r"(?:job|task|prompt|request|text|input|data|context|information|description|question)\s+"
+    r"(?:(?:text|data)\s+)?(?:does\s+not|doesn't|did\s+not|fails?\s+to|lacks?|omits?)\b"
+    r"|no\s+(?:relevant|sufficient)\b"
+    r"|(?:insufficient|not\s+enough)\s+(?:data|information|context|details?)\b"
+    r"|(?:cannot|can't)\s+be\s+(?:determined|verified)\b"
+    r"|there\s+(?:is|are)\s+(?:no|not\s+enough|insufficient)\s+(?:(?:relevant|verified|available|sufficient)\s+)?"
+    r"(?:data|information|context|details?)\b)")
+_NO_DATA_ASSUME_CHARS = 200          # "assum..." trong đoạn đầu này = bài có giả định, không phải bài rỗng
 
 
 def _is_refusal(text: str) -> bool:
     """True nếu output là lời TỪ CHỐI của model (không phải deliverable) -> caller KHÔNG claim."""
     low = " ".join((text or "").split()).lower().lstrip("\"'*-—•.() ")
-    return any(low.startswith(m) for m in _REFUSAL_MARKERS)
+    if any(low.startswith(m) for m in _REFUSAL_MARKERS):
+        return True
+    return bool(_NO_DATA_RE.match(low)) and "assum" not in low[:_NO_DATA_ASSUME_CHARS]
 
 
 def safe_nick(nick: str) -> str:
