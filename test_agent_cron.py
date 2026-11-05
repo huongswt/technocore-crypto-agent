@@ -4383,3 +4383,4 @@ def test_brief_digest_fits_telegram_and_prefers_newest():
          "items": [{"q": f"Q{i}", "a": "x" * 690} for i in range(20)]}
     msg = ac.brief_digest(b)
     assert len(msg) <= 4096 and "Q19" in msg and "Q0\n" not in msg and "mục mới nhất" in msg
+

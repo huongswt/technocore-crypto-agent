@@ -223,7 +223,8 @@ def test_401_drops_the_bearer_and_429_backs_off():
     fake.override[("GET", "/v1/keys/me")] = Resp(401, {"error": "invalid_credential"})
     assert _run(state, fake)["outcome"] == "auth_reset" and "vault" not in state[gw.KEY]
     fake2, st2 = FakeGateway(expires_ms=SOON), {}
-    fake2.override[("POST", "/v1/chat/completions")] = Resp(429, {"error": "overloaded"}, {"Retry-After": "120"})
+    fake2.override[("POST", "/v1/chat/completions")] = Resp(429, {"error": "rate_limit_exceeded"},
+                                                            {"Retry-After": "120"})
     assert _run(st2, fake2)["outcome"] == "rate_limited" and st2[gw.KEY]["wait_until"] == NOW + 120
 
 
@@ -339,17 +340,23 @@ def test_spend_is_taken_from_the_gateway_quota_when_usage_has_no_cost(monkeypatc
     assert state[gw.KEY]["window"]["spent"] == pytest.approx(13.026)      # nhịp chi tiến lên, không kẹt 0
 
 
-def test_default_token_cap_is_the_model_limit(monkeypatch):
+def test_default_token_cap_is_small_and_the_variable_raises_it_up_to_the_model_limit(monkeypatch):
+    # Devnet 2026-11-04: agent khác gửi 16–256 token; mặc định 8192 (= trần model) chỉ có ở agent này.
     monkeypatch.delenv("FLOP_GATEWAY_MAX_TOKENS", raising=False)
     fake = FakeGateway(quota=20000.0, expires_ms=SOON)
     _run({}, fake)
     sent = [c[3]["max_tokens"] for c in fake.calls if c[1] == "/v1/chat/completions"]
-    assert sent and max(sent) == 8192                                     # không còn kẹt ở 1024
+    assert sent and max(sent) == gw.DEFAULT_MAX_TOKENS == 512
+    monkeypatch.setenv("FLOP_GATEWAY_MAX_TOKENS", "100000")              # vẫn không vượt trần model
+    fake2 = FakeGateway(quota=20000.0, expires_ms=SOON)
+    _run({}, fake2)
+    assert max(c[3]["max_tokens"] for c in fake2.calls if c[1] == "/v1/chat/completions") == 8192
 
 
-def test_oversized_request_halves_the_learned_cap_and_errors_parse_openai_shape():
+def test_oversized_request_halves_the_learned_cap_and_errors_parse_openai_shape(monkeypatch):
     # Devnet thật 2026-10-24: 8192 token -> 503 {"error": {"code": "provider_error", "message":
     # "Error: no admitted miner for model ... and budget"}}; 1024 token thì được nhận.
+    monkeypatch.setenv("FLOP_GATEWAY_MAX_TOKENS", "8192")
     fake, state = FakeGateway(quota=20000.0, expires_ms=SOON), {}
     real = fake.__call__
 
@@ -629,6 +636,7 @@ def _fixed_price_gateway(price_field, quota=200.0):
 
 def test_fixed_price_per_call_buys_by_count_with_the_largest_admitted_size(monkeypatch):
     # Giá CỐ ĐỊNH 5 FLOP/lần (giá token = 0): trước đây min_cost = 0 -> pace_wait mãi, không mua gì.
+    monkeypatch.setenv("FLOP_GATEWAY_MAX_TOKENS", "8192")
     fake, http = _fixed_price_gateway({"prompt": "0", "completion": "0", "request": "5"})
     r = gw.run_step({}, agent_key=_key("22"), http=http, now=NOW, prompts=["a", "b"], expect_network="devnet",
                     sleep=lambda s: None, log=lambda *a: None)
@@ -725,6 +733,7 @@ def test_retired_model_triggers_re_enrollment_instead_of_a_permanent_stall():
 
 def test_size_probe_runs_inside_run_step_after_twelve_admitted_calls(monkeypatch):
     # probe_up có test riêng; đây kiểm chỗ GỌI nó trong run_step (độ phủ chỉ ra chưa test nào chạy qua).
+    monkeypatch.setenv("FLOP_GATEWAY_MAX_TOKENS", "8192")
     fake, state = FakeGateway(quota=20000.0, expires_ms=SOON), {}
     _run(state, fake)
     g = state[gw.KEY]
@@ -1079,3 +1088,151 @@ def test_gateway_that_charges_a_replay_is_reported_and_counted(monkeypatch):
     assert r["outcome"] == "replayed" and r["spent"] == pytest.approx(fake.cost)
     assert any("quota tụt" in m for m in logs)
     assert r["replay_charged"] == pytest.approx(fake.cost) and state[gw.KEY]["replay_unsafe"]
+
+
+# --- quota là FLOP + ngân sách operator / gateway hết kênh / request_id (devnet 2026-11-04) ----
+
+POOL_FULL = {"error": {"code": "overloaded", "message": "BrokerOverloadedError: gateway channel pool is full",
+                       "type": "server_error"}, "request_id": "09a4f191-563e-4828-b46d-0e979b3db056"}
+
+
+def _quota_gw(cost=10.0, report_cost=False, expires_ms=None):
+    """Gateway như devnet 2026-11-04: quota 20000 FLOP (llms.txt), quota tụt `cost` (mặc định 10) mỗi lần
+    gọi, usage chỉ có token (giá 0.006/token -> 120 token = 0.72 FLOP)."""
+    fake = FakeGateway(quota=20000.0, expires_ms=expires_ms or (NOW + 20 * 3600) * 1000, cost=cost)
+    fake.report_cost = report_cost
+    return fake
+
+
+def test_pool_full_is_its_own_outcome_with_the_request_id_and_a_short_backoff():
+    fake, state = FakeGateway(expires_ms=SOON), {}
+    fake.override[("POST", "/v1/chat/completions")] = Resp(429, POOL_FULL)      # devnet 11-04: không Retry-After
+    r = _run(state, fake)
+    g = state[gw.KEY]
+    assert r["outcome"] == "overloaded" and "network#31" in r["reason"]
+    assert "req=09a4f191-563e-4828-b46d-0e979b3db056" in r["reason"]
+    assert g["wait_until"] == NOW + gw.OVERLOAD_BACKOFF_SEC < NOW + 300         # lượt sau (5') thử lại
+    assert g["err_ids"][-1]["request_id"] == "09a4f191-563e-4828-b46d-0e979b3db056"
+    assert g["err_ids"][-1]["idem"]                                             # khoá của mình cũng được giữ
+    assert "inflight" not in g                                                  # đã có trả lời -> không treo
+
+
+def test_error_without_a_gateway_request_id_reports_our_idempotency_key():
+    fake, state = FakeGateway(expires_ms=SOON), {}
+    fake.override[("POST", "/v1/chat/completions")] = Resp(429, {"error": "rate_limit_exceeded"})
+    r = _run(state, fake, new_key=lambda: "idem-key-1")
+    assert r["outcome"] == "rate_limited" and r["reason"].endswith("req=idem-key-1")
+    assert state[gw.KEY]["err_ids"][-1] == {"ts": NOW, "status": 429, "code": "rate_limit_exceeded",
+                                            "request_id": "", "idem": "idem-key-1"}
+
+
+def test_error_ids_are_capped():
+    fake, state = FakeGateway(expires_ms=SOON), {}
+    fake.override[("POST", "/v1/chat/completions")] = Resp(429, POOL_FULL)
+    for i in range(gw.ERR_IDS_KEEP + 5):
+        state.setdefault(gw.KEY, {})["wait_until"] = 0
+        _run(state, fake)
+    assert len(state[gw.KEY]["err_ids"]) == gw.ERR_IDS_KEEP
+
+
+def test_request_id_is_read_from_the_header_too():
+    e = None
+    try:
+        gw._call(lambda *a, **k: Resp(503, {"error": "x"}, {"x-request-id": "hdr-1"}), "GET", "https://h/x")
+    except gw.GatewayError as err:
+        e = err
+    assert e is not None and e.request_id == "hdr-1"
+
+
+def test_overload_detection_does_not_swallow_ordinary_limits():
+    assert gw.is_overloaded(gw.GatewayError(429, "overloaded", "BrokerOverloadedError: gateway channel pool is full"))
+    assert gw.is_overloaded(gw.GatewayError(503, "server_error", "gateway channel pool is full"))
+    assert not gw.is_overloaded(gw.GatewayError(429, "rate_limit_exceeded", "slow down"))
+    assert not gw.is_overloaded(gw.GatewayError(500, "overloaded", "x"))
+
+
+def test_lag_from_gateway_overload_is_logged_but_never_alerted(monkeypatch):
+    monkeypatch.setenv("FLOP_GATEWAY_MARGIN_SEC", "0")
+    g = {"window": {"start": NOW, "horizon": NOW + 86400, "total": 25.0, "spent": 0.0}}
+    kw = dict(pct=10, alert_hours=3, realert_hours=6)
+    alerts = []
+    for h in range(4, 13):
+        line, alert, _ = gw.lag_status(g, NOW + h * 3600, "overloaded", **kw)
+        alerts.append(alert)
+    assert line and "overloaded" in line and alerts == [None] * len(alerts)
+    # Lý do khác chiếm ưu thế thì vẫn báo như cũ.
+    for h in range(13, 30):
+        _, alert, _ = gw.lag_status(g, NOW + h * 3600, "no_miner", **kw)
+        if alert:
+            break
+    assert alert and "no_miner" in alert
+
+
+def test_quota_is_flop_by_default_and_paced_over_the_whole_allowance():
+    # llms.txt: "a quota of up to 20,000 devnet FLOP". Bản trước tự giới hạn ở số dư ví (25 FLOP).
+    fake, state = _quota_gw(expires_ms=SOON), {}
+    r = _run(state, fake)
+    g = state[gw.KEY]
+    assert g["window"]["unit"] == "quota" and g["window"]["total"] == pytest.approx(20000.0)
+    assert "flop_budget" not in g and r.get("budget") is None
+    assert r["outcome"] == "spent" and r["calls"] == 2                       # sát hạn: chạy hết công suất lượt
+    assert r["last"]["src"] == "quota" and r["last"]["cost"] == pytest.approx(10.0)
+
+
+def test_charged_amount_is_checked_against_token_pricing():
+    fake, state, logs = _quota_gw(expires_ms=SOON), {}, []
+    gw.run_step(state, agent_key=_key("22"), http=fake, now=NOW, prompts=["q1"], expect_network="devnet",
+                sleep=lambda s: None, log=logs.append)
+    # gateway trừ 10, token × giá = 120 × 0.006 = 0.72 -> tỉ lệ ~13.9 (lệch: đơn vị giá đáng ngờ)
+    assert state[gw.KEY]["charged_vs_priced"] == pytest.approx(10 / 0.72, rel=1e-3)
+    assert any("token × giá = 0.72" in m for m in logs)
+
+
+def test_budget_spend_falls_back_to_token_pricing_when_nothing_else_is_known(monkeypatch):
+    monkeypatch.setenv("FLOP_GATEWAY_BUDGET_FLOP", "15")
+    fake, state = _quota_gw(expires_ms=SOON, cost=0.0), {}                    # quota không tụt, không cost_flop
+    r = _run(state, fake)
+    assert r["last"]["src"] == "price" and r["last"]["cost"] == pytest.approx(0.72)
+    assert state[gw.KEY]["flop_budget"]["spent"] == pytest.approx(0.72 * r["calls"])
+
+
+def test_operator_budget_caps_the_allowance_and_stops_neutrally(monkeypatch):
+    monkeypatch.setenv("FLOP_GATEWAY_BUDGET_FLOP", "15")
+    fake, state, logs = _quota_gw(expires_ms=SOON, cost=6.0), {}, []
+    r = gw.run_step(state, agent_key=_key("22"), http=fake, now=NOW, prompts=["q1", "q2"],
+                    expect_network="devnet", sleep=lambda s: None, log=logs.append)
+    g = state[gw.KEY]
+    assert g["window"]["unit"] == "flop" and g["window"]["total"] == pytest.approx(15.0)
+    assert any("ngân sách allowance này: 15 FLOP" in m for m in logs)
+    assert g["flop_budget"]["spent"] == pytest.approx(r["spent"]) and r["budget"] == pytest.approx(15 - r["spent"])
+    g["flop_budget"]["spent"], g["wait_until"] = 15.0, 0
+    r2 = _run(state, fake)
+    assert r2["outcome"] == "budget_spent" and "quota gateway còn" in r2["reason"]
+
+
+def test_operator_budget_follows_the_variable_and_resets_per_allowance(monkeypatch):
+    monkeypatch.setenv("FLOP_GATEWAY_BUDGET_FLOP", "15")
+    fake, state = _quota_gw(expires_ms=SOON), {}
+    _run(state, fake)
+    monkeypatch.setenv("FLOP_GATEWAY_BUDGET_FLOP", "40")
+    state[gw.KEY]["wait_until"] = 0
+    _run(state, fake)
+    assert state[gw.KEY]["flop_budget"]["cap"] == 40.0                        # đổi biến -> trần mới
+    spent = state[gw.KEY]["flop_budget"]["spent"]
+    state[gw.KEY].update(enrolled_at=NOW + 99, wait_until=0)                  # allowance mới
+    _run(state, fake)
+    assert state[gw.KEY]["flop_budget"]["spent"] < spent + 1e-9 and state[gw.KEY]["flop_budget"]["enrolled_at"] == NOW + 99
+
+
+def test_switching_back_from_the_old_wallet_budget_reopens_the_window():
+    # Agent đang chạy bản trước: cửa sổ 'flop' total=25 + flop_budget src=balance. Bỏ biến -> rải cả quota.
+    fake, state, logs = _quota_gw(expires_ms=SOON), {}, []
+    _run(state, fake)
+    state[gw.KEY].update(window={**state[gw.KEY]["window"], "unit": "flop", "total": 25.0},
+                         flop_budget={"enrolled_at": state[gw.KEY].get("enrolled_at"), "cap": 25.0,
+                                      "spent": 0.0, "src": "balance"}, wait_until=0)
+    gw.run_step(state, agent_key=_key("22"), http=fake, now=NOW + 300, prompts=["q1"], expect_network="devnet",
+                sleep=lambda s: None, log=logs.append)
+    g = state[gw.KEY]
+    assert "flop_budget" not in g and g["window"]["unit"] == "quota" and g["window"]["total"] > 19000
+    assert any("đổi thước đo nhịp chi flop -> quota" in m for m in logs)

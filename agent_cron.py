@@ -4903,6 +4903,7 @@ def gateway_session_step(state: dict, private_key, now: int):
     status = f"{r.get('calls', 0)}✓ gateway/{oc}"
     _l = r.get("last") or {}
     detail = (f" spent={r.get('spent')} due={r.get('due')} quota={r.get('remaining')}"
+              + (f" budget={r.get('budget')}FLOP" if r.get("budget") is not None else "")
               + (f" tokens={_l.get('tokens')} src={_l.get('src')}" if _l else "")
               + (f" settled={r.get('settled_total')}/{r.get('receipts_total')}rc"
                  if r.get("receipts_total") is not None else "")

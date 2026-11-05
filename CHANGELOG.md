@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- The gateway quota is FLOP again. `flop.network/llms.txt` says each address gets "a quota of up to
+  20,000 devnet FLOP that expires after 24 hours", gateway credit rather than the wallet balance. The
+  earlier heuristic (quota more than 4x the wallet balance means it is not FLOP) capped the allowance at
+  the wallet's 25 FLOP, so it is removed together with the explorer balance read and
+  `FLOP_GATEWAY_ALLOWANCE_FLOP`. `FLOP_GATEWAY_BUDGET_FLOP` stays as an optional per-allowance cap (a
+  neutral `budget_spent` outcome). After each paid call the charged amount is compared with token x
+  list price, to settle whether the price is per token or per 1K tokens.
+- Once an allowance is paced by a FLOP budget, it stays that way until the next enrollment. A growing
+  wallet (2000 FLOP a day from the verified faucet tier) used to make a 20000 quota look like FLOP again
+  after about three days, so spend was measured in quota units and the daily cap stopped after a few
+  real FLOP. A new allowance uses the measured quota-per-FLOP ratio, when known, instead of the balance.
+- Gateway pacing no longer treats `remaining_quota` as FLOP when it plainly is not (devnet 2026-11-04:
+  every key gets 20000 while the wallet holds 25 FLOP). With a readable wallet balance, a quota more than
+  4x the balance switches pacing to a FLOP budget per allowance (wallet balance, or
+  `FLOP_GATEWAY_BUDGET_FLOP`; `FLOP_GATEWAY_ALLOWANCE_FLOP`, default 25, until the balance is read).
+  Spend is priced from usage tokens instead of the quota drop, and the quota-per-FLOP ratio is logged.
+  Before, the pacer targeted ~11,000 FLOP a day and would have spent the whole balance within hours of
+  the gateway recovering.
+- The default completion size is 512 tokens instead of the model limit (8192); `FLOP_GATEWAY_MAX_TOKENS`
+  still raises it up to the model limit.
+- `429 overloaded` / "gateway channel pool is full" (flop-labs/network#31) is its own `overloaded`
+  outcome. It backs off for 240 s so the next run retries, is neutral for the real-spend watchdog, and
+  never sends the spend-lag Telegram alert (it is still logged).
+- Failed gateway requests log `req=<id>` (the gateway `request_id`, else our `Idempotency-Key`), and the
+  last 20 are kept in state for bug reports.
 - A `settled` gateway receipt whose `settled_spend` and `settled_spend_raw` are still null (OpenAPI:
   "unknown", never zero) is kept open and booked once the gateway fills the amount; it was marked seen
   at 0 FLOP and never booked.
@@ -75,6 +100,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test_packaging` keeps the list in sync.
 
 ### Added
+- The testnet radar reports new commits to `flop-labs/yellowpaper` (Arthur Hayes, 2026-11-05: "have your agent monitor the yellow paper git repo for changes"), with the commit messages,
+  the changed files and a compare link. The first run only records the current head.
 - **Multi-room listen & respond (`AGENT_ROOMS`).** `auto_respond` can now listen and reply across
   a CSV list of rooms (e.g. `lobby,meta,flop`) in one run, each reply routed back to the room it
   came from. Kept **synchronous** (the codebase is `requests` + 5-min cron — fetching a few rooms
