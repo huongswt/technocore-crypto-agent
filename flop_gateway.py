@@ -622,6 +622,11 @@ def lag_status(g: dict, now: int, outcome: str, *, pct: float, alert_hours: floa
     lag = dict(g.get("lag") or {})
     if not win or not win.get("total"):
         return None, None, None
+    if win.get("horizon") and now >= int(win["horizon"]):
+        # Cửa sổ đã qua hạn (allowance hết hạn, gateway trả 403 nên không mở cửa sổ mới):
+        # không còn gì "đến hạn" để chi. Đo tiếp thì mỗi lượt in "tụt 100%" mãi mãi.
+        g["lag"] = {}
+        return None, None, None
     total, spent = float(win["total"]), float(win.get("spent") or 0)
     start = int(win.get("start") or now)
     end = int(win.get("horizon") or now) - int(_env_num("FLOP_GATEWAY_MARGIN_SEC", 1800))

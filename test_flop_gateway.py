@@ -539,6 +539,20 @@ def test_lag_check_is_quiet_without_a_window():
     assert gw.lag_status({}, NOW, "error", pct=10, alert_hours=3, realert_hours=6) == (None, None, None)
 
 
+def test_lag_check_stops_once_the_window_has_expired(monkeypatch):
+    # Devnet 2026-11-05: allowance hết hạn, gateway 403 nên cửa sổ cũ không được thay; trước đây
+    # mỗi lượt vẫn in "chi tụt lại 20000 FLOP (100%)" và có thể nhắc Telegram mãi.
+    monkeypatch.setenv("FLOP_GATEWAY_MARGIN_SEC", "0")
+    day = 86400
+    g = {"window": {"start": NOW, "horizon": NOW + day, "total": 20000.0, "spent": 0.0},
+         "lag": {"since": NOW, "reasons": {"rate_limited": 5}, "alerted": NOW}}
+    kw = dict(pct=10, alert_hours=3, realert_hours=6)
+    assert gw.lag_status(g, NOW + day - 60, "rate_limited", **kw)[0]          # còn hạn: vẫn đo
+    assert gw.lag_status(g, NOW + day, "forbidden", **kw) == (None, None, None)
+    assert gw.lag_status(g, NOW + 3 * day, "backoff", **kw) == (None, None, None)
+    assert g["lag"] == {}
+
+
 def test_small_quota_refund_keeps_the_window_and_a_topup_opens_a_new_one():
     day = 86400
     due, win = gw.window_due(None, 20000.0, NOW, NOW + day + 1800, 300, 1800, topup_min=13)
