@@ -1373,9 +1373,12 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
             # x402: KHÔNG tự trả. Ghi lại hình dạng để chỉnh adapter bằng tay.
             return done("payment_required", reason=f"402 {e.code or ''} {e.message}".strip(), payment=pay)
         if e.status == 403:
-            backoff(3600, f"403 {e.code}")
+            # Allowance hết hạn/thu hồi/hết là VĨNH VIỄN trên ví + mạng này (OpenAPI: "never renewed"):
+            # nghỉ 1 ngày thay vì gõ lại gateway mỗi giờ. Đổi mạng hoặc ví thì trạng thái làm lại từ đầu.
+            final = any(w in e.code.lower() for w in ("expired", "revoked", "exhausted"))
+            backoff(86400 if final else 3600, f"403 {e.code}")
             return done("unfunded" if "unfunded" in e.code.lower() else "forbidden",
-                        reason=f"403 {e.code} {e.message}".strip())
+                        reason=f"403 {e.code} {e.message}".strip() + (f" — {EXHAUSTED_NOTE}" if final else ""))
         if e.status == 503 and "no admitted miner" in e.message.lower() and g.get("last_mt"):
             # Không miner nào nhận yêu cầu CỠ này -> lần sau gửi nửa cỡ (không phải mạng quá tải).
             bad = int(g["last_mt"])

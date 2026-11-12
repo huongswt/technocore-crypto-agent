@@ -298,6 +298,16 @@ def test_exhausted_code_matches_regardless_of_case():
     fake, state = FakeGateway(expires_ms=SOON), {}
     fake.override[("POST", "/v1/chat/completions")] = Resp(403, {"error": "WALLET_UNFUNDED"})
     assert _run(state, fake)["outcome"] == "unfunded"
+    assert state[gw.KEY]["wait_until"] == NOW + 3600                    # chưa nạp: thử lại sau 1h
+
+
+def test_expired_allowance_backs_off_a_day_not_an_hour():
+    # Devnet 2026-11-09: allowance hết hạn -> 403 mỗi giờ, mãi mãi. Không bao giờ được cấp lại.
+    fake, state = FakeGateway(expires_ms=SOON), {}
+    fake.override[("POST", "/v1/chat/completions")] = Resp(403, {"error": "devnet_enrollment_expired"})
+    r = _run(state, fake)
+    assert r["outcome"] == "forbidden" and "không được cấp lại" in r["reason"]
+    assert state[gw.KEY]["wait_until"] == NOW + 86400
 
 
 def test_zero_quota_reason_says_the_allowance_is_not_renewed():
