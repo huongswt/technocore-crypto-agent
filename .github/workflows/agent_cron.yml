@@ -102,6 +102,9 @@ jobs:
       - name: Run signed agent
         env:
           AGENT_PRIVATE_KEY: ${{ secrets.AGENT_PRIVATE_KEY }}
+          # Token CỦA LƯỢT CHẠY (quyền contents: read ở trên): chỉ gửi tới api.github.com, để radar issue/
+          # commit và job review không chia 60 request/giờ chung IP runner.
+          GITHUB_TOKEN: ${{ github.token }}
           STATE_FILE: state.json
           # Actions là runner DUY NHẤT (chạy chính mỗi 5'). Để 'backup' nếu sau này thêm
           # runner thứ 2 làm chính (xem cơ chế heartbeat trong agent_cron.py): khi đó Actions
@@ -158,6 +161,8 @@ jobs:
           FLOP_KIBBLE_DUP_SIM: ${{ vars.FLOP_KIBBLE_DUP_SIM }}
           # Vân tay chống-trùng hết hạn sau ngần này giờ (trống = 6). <=0 = không hết hạn.
           FLOP_KIBBLE_DUP_HOURS: ${{ vars.FLOP_KIBBLE_DUP_HOURS }}
+          # Trần ký tự ĐỀ BÀI (title + body) của job đưa vào model (trống = 4000, sàn 500).
+          FLOP_KIBBLE_TASK_MAX_CHARS: ${{ vars.FLOP_KIBBLE_TASK_MAX_CHARS }}
           # Báo cáo CHI TIÊU FLOP định kỳ qua Telegram (mặc định TẮT). Dùng lại 2 secret
           # Telegram của bước cảnh báo; agent chỉ ĐỌC chúng để gửi, không bao giờ log.
           FLOP_DAILY_REPORT_ENABLED: ${{ vars.FLOP_DAILY_REPORT_ENABLED }}
@@ -343,6 +348,13 @@ jobs:
           # ngưỡng = ALERT_MIN). off = mua tiếp dù chưa xác nhận.
           FLOP_ATTRIB_GATE: ${{ vars.FLOP_ATTRIB_GATE }}
           FLOP_ATTRIB_GATE_MIN: ${{ vars.FLOP_ATTRIB_GATE_MIN }}
+          # Đang dừng mua vì chưa đứng tên: mỗi N giờ mua THĂM DÒ 1 lần nhỏ để tự mở lại khi chain
+          # ghi chi tiêu cho ví mình (mặc định 6; 0 = tắt thăm dò).
+          FLOP_ATTRIB_PROBE_HOURS: ${{ vars.FLOP_ATTRIB_PROBE_HOURS }}
+          # Mạng testnet mang tên riêng không có chữ "testnet" (vd aurora-1): đặt ĐÚNG tên /health trả.
+          FLOP_TESTNET_NETWORK_NAME: ${{ vars.FLOP_TESTNET_NETWORK_NAME }}
+          # Ghim genesis hash (0x…) của chain được phép chi; trống = không ghim.
+          FLOP_GATEWAY_GENESIS: ${{ vars.FLOP_GATEWAY_GENESIS }}
           # Trần FLOPs MỘT phiên (tùy chọn) — phiên to hơn tách thành nhiều phiên.
           FLOP_SESSION_MAX_FLOPS: ${{ vars.FLOP_SESSION_MAX_FLOPS }}
           # (testnet) Trần phiên chờ proof: đủ N thì ngừng đăng phiên mới (mặc định 3, 0 = tắt).

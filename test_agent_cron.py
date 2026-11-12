@@ -1240,7 +1240,12 @@ def test_key_rejected_only_when_the_body_speaks_about_the_key():
     gem = '{"error": {"code": 400, "message": "API key not valid. Please pass a valid API key.", ' \
           '"status": "INVALID_ARGUMENT", "details": [{"reason": "API_KEY_INVALID"}]}}'
     assert ac._key_rejected(_http_error_body(400, gem)) == 400
-    assert ac._key_rejected(_http_error_body(403, '{"error": {"status": "PERMISSION_DENIED"}}')) == 403
+    # 403 PERMISSION_DENIED trơn = key không được dùng MỘT model, không phải khoá hỏng.
+    assert ac._key_rejected(_http_error_body(403, '{"error": {"status": "PERMISSION_DENIED"}}')) == 0
+    off = '{"error": {"status": "PERMISSION_DENIED", "details": [{"reason": "SERVICE_DISABLED"}]}}'
+    assert ac._key_rejected(_http_error_body(403, off)) == 403                                 # API chưa bật
+    blk = '{"error": {"status": "PERMISSION_DENIED", "details": [{"reason": "API_KEY_SERVICE_BLOCKED"}]}}'
+    assert ac._key_rejected(_http_error_body(403, blk)) == 403
     assert ac._key_rejected(_http_error_body(400, '{"error": "max_tokens too large"}')) == 0   # request sai
     assert ac._key_rejected(_http_error(503)) == 0 and ac._key_rejected(ValueError("x")) == 0
 
@@ -3403,6 +3408,50 @@ def test_radar_keeps_wallet_readings_when_telegram_fails(monkeypatch):
     assert "last_radar" not in saved and saved[flop_radar.KEY] is r
 
 
+def _spend_radar(monkeypatch, radar_on):
+    import flop_radar
+    monkeypatch.setattr(ac, "TESTNET_RADAR", radar_on)
+    monkeypatch.setattr(ac, "_radar_wallet", lambda pk: "5Wallet")
+    monkeypatch.setattr(ac, "_radar_explorers", lambda: (_TN,))
+    monkeypatch.setattr(ac, "gateway_attribution_step", lambda st, now: "ok")
+    monkeypatch.setattr(ac, "save_state", lambda d: None)
+    sent, ok = [], {"v": False}
+    monkeypatch.setattr(ac, "_telegram_send", lambda t: sent.append(t) or ok["v"])
+
+    def step(st, now, spent_flop):
+        monkeypatch.setattr(ac, "_radar_fetch", _wallet_pages(spent_flop * 10 ** 18))
+        n = len(sent)
+        ac.testnet_radar_step(st, now)
+        return [t for t in sent[n:] if "on-chain" in t]
+    return flop_radar, sent, ok, step
+
+
+@pytest.mark.parametrize("radar_on", [True, False])
+def test_onchain_spend_alerts_survive_telegram_failure(monkeypatch, radar_on):
+    # Telegram lỗi -> mốc "đã báo" (cả mốc ngày) hoàn về: lần đầu và tin ngày đều được gửi lại ở lượt
+    # sau, gộp đúng phần tăng, không bị nuốt vì số đọc mới đã nằm trong state. Cả radar bật lẫn tắt.
+    if not radar_on:
+        monkeypatch.setenv("TESTNET_ENABLED", "true")
+    flop_radar, sent, ok, step = _spend_radar(monkeypatch, radar_on)
+    h, T, H = "explorer.testnet.flop.network", 1_800_000_000, 3600
+    st = {flop_radar.KEY: {"status": "planned"}}
+    msgs = step(st, T, 3)                                                  # testnet mở: đã chi 3
+    assert msgs and "+3 FLOP (tổng 3 FLOP)" in msgs[0] and "LẦN ĐẦU" in msgs[0]
+    assert st[flop_radar.KEY]["attr_spent_raw"][h] == 3 * 10 ** 18          # số đọc GIỮ (cổng đứng tên)
+    assert not st[flop_radar.KEY].get("attr_spent_notified", {}).get(h)    # chưa gửi được -> chưa báo
+    ok["v"] = True
+    msgs = step(st, T + H, 5)
+    assert msgs and "+5 FLOP (tổng 5 FLOP)" in msgs[0] and "LẦN ĐẦU" in msgs[0]
+    assert step(st, T + 2 * H, 6) == []                                    # tăng trong ngày: gộp, im
+    ok["v"] = False
+    msgs = step(st, T + 25 * H, 8)                                         # tin ngày, gửi lỗi
+    assert msgs and "+3 FLOP (tổng 8 FLOP)" in msgs[0]
+    ok["v"] = True
+    msgs = step(st, T + 26 * H, 9)                                         # gửi lại, gộp thêm
+    assert msgs and "+4 FLOP (tổng 9 FLOP)" in msgs[0]
+    assert step(st, T + 27 * H, 10) == []                                  # mốc ngày mới: chờ 24h
+
+
 def test_radar_off_still_reads_the_wallet_on_testnet(monkeypatch, tmp_path):
     import flop_radar
     monkeypatch.setattr(ac, "TESTNET_RADAR", False)
@@ -4410,4 +4459,281 @@ def test_brief_digest_fits_telegram_and_prefers_newest():
          "items": [{"q": f"Q{i}", "a": "x" * 690} for i in range(20)]}
     msg = ac.brief_digest(b)
     assert len(msg) <= 4096 and "Q19" in msg and "Q0\n" not in msg and "mục mới nhất" in msg
+
+
+# --- Bản KV đã ký phải sống sót qua sweep_for_sign của kv_set ------------------------------------
+
+_SWEEP_HOSTILE = {
+    "double_space": "inference-session gateway  model-x",
+    "triple_space": "a   b",
+    "nbsp": "a\u00a0b",
+    "zero_width": "route\u200bnew",
+    "soft_hyphen": "foo\u00adbar",
+    "zwj_emoji": "\U0001f468\u200d\U0001f4bb dev",
+    "tab_newline": "line1\n\tline2",
+    "edges": "  lead and trail  ",
+    "backslash_space": "c:\\dir\\  x",
+    "quote": 'he said "hi"  twice',
+    "vn": "⚠️ số dư ví",
+}
+
+
+def test_sealed_kv_blob_is_untouched_by_sweep_and_still_verifies():
+    """kv_set quét MỌI value trước khi gửi; chữ ký tính trên thân gốc. Bản niêm phong phải ở dạng
+    mà sweep không đổi được ký tự nào — không thì một chuỗi có 2 dấu cách/NBSP/zero-width trong
+    thân làm cả bản bền bị từ chối khi đọc lại."""
+    key = _real_key()
+    for name, s in _SWEEP_HOSTILE.items():
+        body = {"last_seq": 5, "entries": [{"memo": s}], s: 1}
+        sealed = ac._kv_seal(key, body)
+        assert ac.sweep_for_sign(sealed) == sealed, name
+        assert ac._kv_open(ac.sweep_for_sign(sealed), key) == body, name
+
+
+def test_sealed_state_round_trips_through_real_kv_set(monkeypatch):
+    """Cả đường thật: persist -> kv_set (có sweep) -> POST -> đọc lại -> hydrate."""
+    import time as _t
+    now = int(_t.time())
+    key = _real_key()
+    store = {}
+
+    def _post(url, json=None, headers=None, timeout=None):
+        store[url.rsplit("/", 1)[-1]] = json["value"]
+        return _Resp(status=200)
+
+    monkeypatch.setattr(ac.requests, "post", _post)
+    monkeypatch.setattr(ac, "load_state", lambda: {
+        "last_telemetry": now - 60,
+        "testnet_radar": {"status": "in  progress", "network": "flop\u00a0testnet"}})
+    ac.persist_durable_to_kv(key, ac.did_of(key))
+    monkeypatch.setattr(ac, "kv_get", lambda k: store.get(k))
+    st = {}
+    ac.hydrate_durable_from_kv(st, key)
+    assert st["last_telemetry"] == now - 60
+    assert st["testnet_radar"] == {"status": "in  progress", "network": "flop\u00a0testnet"}
+
+
+def test_legacy_sealed_blob_format_still_opens():
+    """Bản đã nằm trên KV từ trước (JSON không ép ASCII, có khoảng trắng cấu trúc) vẫn đọc được."""
+    key = _real_key()
+    body = {"last_seq": 7, "note": "số dư"}
+    legacy = json.dumps({"body": body, "sig": ac.sign_message(key, ac._kv_canon(body)),
+                         "did": ac.did_of(key)}, ensure_ascii=False)
+    assert ac._kv_open(legacy, key) == body
+
+
+# --- Đề bài công việc không còn bị cắt ở trần 500 của tin chat -----------------------------------
+
+def test_isolate_for_llm_default_cap_is_chat_sized_and_override_widens_it():
+    long = "y" * 3000
+    assert ("y" * ac.MAX_INPUT_CHARS + "\n") in ac.isolate_for_llm(long)
+    assert "y" * (ac.MAX_INPUT_CHARS + 1) not in ac.isolate_for_llm(long)
+    assert ("y" * 2000 + "\n") in ac.isolate_for_llm(long, 2000)
+    assert "y" * 2001 not in ac.isolate_for_llm(long, 2000)
+
+
+def _capture_reply(monkeypatch, text="A complete answer."):
+    seen = {}
+
+    def _reply(prompt, system, temp, *a, **k):
+        seen["prompt"] = prompt
+        return (text, "stub")
+
+    monkeypatch.setattr(ac, "_active_provider", lambda: True)
+    monkeypatch.setattr(ac, "_meter_flop", lambda *a, **k: None)
+    monkeypatch.setattr(ac, "_provider_reply", _reply)
+    return seen
+
+
+def test_review_job_keeps_verified_facts_when_task_is_long(monkeypatch):
+    """Đề dài hơn 500 ký tự từng đẩy khối VERIFIED FACTS ra ngoài trần -> LLM viết không có dữ
+    kiện mà bài giao vẫn gắn [verified]."""
+    monkeypatch.setattr(ac, "_kibble_recent_fps", [])
+    monkeypatch.setattr(ac, "_gh_get", _fake_gh({
+        "repo": {"full_name": "o/r", "stargazers_count": 31337, "default_branch": "trunk",
+                 "archived": False, "open_issues_count": 99, "pushed_at": "2026-01-01T00:00:00Z"},
+        "commits": [{"commit": {"committer": {"date": "2026-09-04T10:00:00Z"}}}],
+        "search": {"total_count": 7},
+    }))
+    seen = _capture_reply(monkeypatch)
+    body = "Report last commit, open issues, stars, default branch. " + "Criterion text. " * 60
+    assert len(body) > 900
+    out = ac.answer_kibble_job({"type": "review", "title": "Check github.com/o/r",
+                                "body": body, "jobid": "kabc0123457"})
+    p = seen["prompt"]
+    assert "VERIFIED FACTS" in p
+    for fact in ("stars: 31337", "open issues: 7", "last commit: 2026-09-04T10:00:00Z",
+                 "default branch: trunk"):
+        assert fact in p, fact
+    assert p.rstrip().endswith(ac.DELIM_CLOSE)           # dữ kiện vẫn nằm TRONG khối untrusted
+    assert "[verified] o/r" in out
+
+
+def test_review_job_cuts_the_task_not_the_facts_when_over_cap(monkeypatch):
+    monkeypatch.setattr(ac, "_kibble_recent_fps", [])
+    monkeypatch.setattr(ac, "_gh_get", _fake_gh({
+        "repo": {"full_name": "o/r", "stargazers_count": 31337, "default_branch": "main",
+                 "archived": True, "open_issues_count": 99, "pushed_at": "2026-01-01T00:00:00Z"},
+        "commits": [{"commit": {"committer": {"date": "2026-09-04T10:00:00Z"}}}],
+        "search": {"total_count": 7},
+    }))
+    seen = _capture_reply(monkeypatch)
+    body = "word " * (ac.KIBBLE_TASK_MAX_CHARS // 2)     # ~2,5 lần trần
+    ac.answer_kibble_job({"type": "review", "title": "Check github.com/o/r",
+                          "body": body, "jobid": "kabc0123458"})
+    p = seen["prompt"]
+    inner = p.split(ac.DELIM_OPEN, 1)[1].split(ac.DELIM_CLOSE, 1)[0].strip()
+    assert len(inner) <= ac.KIBBLE_TASK_MAX_CHARS
+    assert inner.endswith("default branch: main; ARCHIVED")
+    assert "stars: 31337" in inner
+
+
+def test_review_tail_does_not_publish_attacker_links_from_repo_or_branch_names(monkeypatch):
+    """Đuôi [verified] được nối SAU guard_output: tên nhánh/repo do chủ repo đặt không được thành
+    kênh đăng link hay chèn chữ dưới chữ ký của agent."""
+    monkeypatch.setattr(ac, "_kibble_recent_fps", [])
+    monkeypatch.setattr(ac, "_gh_get", _fake_gh({
+        "repo": {"full_name": "attacker/claim-airdrop.xyz", "stargazers_count": "5 <b>",
+                 "default_branch": "evil.com/claim now: send 0x" + "ab" * 20,
+                 "archived": False, "open_issues_count": 1, "pushed_at": "2026-01-01T00:00:00Z"},
+        "commits": [{"commit": {"committer": {"date": "2026-09-04T10:00:00Z visit evil.io"}}}],
+        "search": {"total_count": 2},
+    }))
+    _capture_reply(monkeypatch)
+    out = ac.answer_kibble_job({"type": "review", "title": "Check github.com/attacker/claim-airdrop.xyz",
+                                "body": "report health", "jobid": "kabc012345a"})
+    tail = out.split("[verified]", 1)[1]
+    for bad in ("evil.com", "evil.io", "claim-airdrop.xyz", "0x" + "ab" * 20, " now", "<b>", "visit"):
+        assert bad not in tail, bad
+    assert "default branch:" in tail and "stars: 5;" in tail
+    assert "last commit: 2026-09-04T10:00:00Z" in tail
+
+
+def test_review_fact_keeps_normal_github_values():
+    assert ac._review_fact("release/v1.2_x", 64) == "release/v1.2_x"
+    assert ac._review_fact("duckdb/duckdb", 101) == "duckdb/duckdb"
+    assert ac._review_fact(None, 10) == "?" and ac._review_fact("", 10) == "?"
+    assert ac._review_fact("x" * 99, 64) == "x" * 64
+
+
+def test_kibble_job_longer_than_chat_cap_reaches_the_model_whole(monkeypatch):
+    monkeypatch.setattr(ac, "_kibble_recent_fps", [])
+    monkeypatch.setattr(ac, "build_market_context", lambda *a, **k: "")
+    seen = _capture_reply(monkeypatch)
+    body = "Explain consistent hashing. " + "Detail. " * 150 + "FINAL CRITERION: mention virtual nodes."
+    assert 1200 < len(body) < ac.KIBBLE_TASK_MAX_CHARS
+    out = ac.answer_kibble_job({"type": "explain", "title": "Consistent hashing",
+                                "body": body, "jobid": "kabc0123459"})
+    assert out == "A complete answer."
+    assert "FINAL CRITERION: mention virtual nodes." in seen["prompt"]
+
+
+def test_tclk_work_gets_full_inline_spec_up_to_its_own_cap(monkeypatch):
+    seen = _capture_reply(monkeypatch)
+    monkeypatch.setattr(ac, "TCLK_ROOM_GROUNDING", False)
+    spec = "Write a short note on HTLC timeouts. " + "Pad. " * 250 + "LAST REQUIREMENT: name the refund path."
+    assert 500 < len(spec) <= ac.TCLK_INLINE_SPEC_MAX
+    out = ac.tclk_do_work({"offer_id": "o1", "job": {"id": "j1", "context": spec}})
+    assert out == "A complete answer."
+    assert "LAST REQUIREMENT: name the refund path." in seen["prompt"]
+    # Spec đọc từ KV (không qua trần inline) vẫn bị kẹp, không phình prompt vô hạn.
+    monkeypatch.setattr(ac, "kv_get_ns", lambda ns, k: "z" * 9000)
+    ac.tclk_do_work({"offer_id": "o2", "job": {"id": "j2", "context": "/kv/ns/key"}})
+    assert "z" * (ac.TCLK_INLINE_SPEC_MAX + 81) not in seen["prompt"]
+
+
+# --- 5 mục Low chung -----------------------------------------------------------------------------
+
+def test_explicit_provider_outside_the_order_is_used(monkeypatch, capsys):
+    _keys(monkeypatch, gemini="gk", openai="ok", mode="openai")
+    monkeypatch.setattr(ac, "LLM_PROVIDER_ORDER", ["gemini", "deepseek", "groq", "openrouter"])
+    assert ac._provider_chain() == ["openai"]
+
+
+def test_explicit_provider_without_a_key_disables_llm_with_a_warning(monkeypatch, capsys):
+    _keys(monkeypatch, gemini="gk", mode="openai")
+    monkeypatch.setattr(ac, "_provider_warned", set())
+    assert ac._provider_chain() == []
+    assert "chưa có API key" in capsys.readouterr().out
+
+
+def test_unknown_provider_value_falls_back_to_auto_with_one_warning(monkeypatch, capsys):
+    _keys(monkeypatch, gemini="gk", deepseek="dk", mode="gemni")
+    monkeypatch.setattr(ac, "LLM_PROVIDER_ORDER", ["gemini", "nope", "deepseek"])
+    monkeypatch.setattr(ac, "_provider_warned", set())
+    assert ac._provider_chain() == ["gemini", "deepseek"]
+    ac._provider_chain()
+    out = capsys.readouterr().out
+    assert out.count("'gemni'") == 1 and out.count("tên lạ ['nope']") == 1
+
+
+def test_gemini_model_level_403_cools_the_model_not_the_provider(monkeypatch):
+    calls = []
+    denied = '{"error": {"code": 403, "message": "You do not have permission to access this model.", '              '"status": "PERMISSION_DENIED"}}'
+
+    def post(url, **k):
+        calls.append(url)
+        if "gemini-locked" in url:
+            return _resp_status_body(403, denied)
+        return _resp_with_body({"candidates": [{"content": {"parts": [{"text": "ok"}]}}]})
+
+    monkeypatch.setattr(ac.requests, "post", post)
+    monkeypatch.setattr(ac, "GEMINI_API_KEY", "gk")
+    monkeypatch.setattr(ac, "GEMINI_MODEL", "gemini-locked")
+    monkeypatch.setattr(ac, "_gemini_model_cache", None)
+    monkeypatch.setattr(ac, "_gemini_429", {})
+    monkeypatch.setattr(ac, "_gemini_404", set())
+    monkeypatch.setattr(ac, "_gemini_list_models", lambda: ["gemini-locked", "gemini-2.0-flash"])
+    assert ac._gemini_reply("hi", "sys", 0.5) == "ok"
+    assert "gemini" not in ac._llm_dead and ac._gemini_cooling("gemini-locked")
+    calls.clear()
+    monkeypatch.setattr(ac, "_gemini_model_cache", None)
+    ac._gemini_reply("hi", "sys", 0.5)
+    assert not any("gemini-locked" in u for u in calls)              # không thử lại model bị chặn
+
+
+def test_github_token_goes_only_to_the_github_api(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghs_secret")
+    assert ac._github_headers("https://api.github.com/repos/x/y")["Authorization"] == "Bearer ghs_secret"
+    for url in ("https://docs.flop.network/llms.txt", "https://api.github.com.evil.example/x",
+                "http://api.github.com/repos/x/y", "https://technocore.chat/openapi.json"):
+        assert "Authorization" not in ac._github_headers(url), url
+    monkeypatch.delenv("GITHUB_TOKEN")
+    assert "Authorization" not in ac._github_headers("https://api.github.com/repos/x/y")
+
+
+def test_github_fetchers_send_the_token_and_report_rate_limits(monkeypatch, capsys):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghs_secret")
+    monkeypatch.setattr(ac, "_provider_warned", set())
+    seen = []
+
+    class _R:
+        status_code, text, headers = 403, "", {"X-RateLimit-Remaining": "0"}
+
+    monkeypatch.setattr(ac.requests, "get", lambda url, headers=None, **k: seen.append(headers) or _R())
+    assert ac._gh_get("/repos/o/r") is None
+    assert ac._radar_fetch("https://api.github.com/repos/flop-labs/yellowpaper/issues/172") is None
+    assert all(h.get("Authorization") == "Bearer ghs_secret" for h in seen)
+    assert capsys.readouterr().out.count("GitHub API hết hạn mức") == 1
+
+
+def test_engage_asks_the_peer_in_the_room_they_spoke_in(monkeypatch):
+    posts = []
+    monkeypatch.setattr(ac, "AGENT_ROOMS", ["lobby", "flop"])
+    monkeypatch.setattr(ac, "ROOM", "flop")
+    monkeypatch.setattr(ac, "ENGAGE_ENABLED", True)
+    monkeypatch.setattr(ac, "ENGAGE_DRY_RUN", False)
+    monkeypatch.setattr(ac, "OUTCOME_GUARD", False)
+    monkeypatch.setattr(ac, "_engage_question", lambda t: "What exact threshold do you use?")
+    peer = "did:key:z6MkPEERPEERPEERPEERPEERPEERPEERPEERPEERPEER1234"
+    text = "We reject any price feed older than ninety seconds before computing the median."
+    data = {"lobby": {"messages": [{"seq": 5, "from": peer, "text": text}], "last_seq": 5},
+            "flop": {"messages": [], "last_seq": 9}}
+    monkeypatch.setattr(ac, "fetch_messages", lambda since=None, room=ac.ROOM: data[room])
+    monkeypatch.setattr(ac, "post_message", lambda pk, did, t, room=ac.ROOM: posts.append(room) or True)
+    monkeypatch.setattr(ac, "kv_set", lambda *a, **k: True)
+    monkeypatch.setattr(ac, "load_state", lambda: {"cursors": {"lobby": 1, "flop": 1}})
+    monkeypatch.setattr(ac, "save_state", lambda d: None)
+    ac.auto_respond(Ed25519PrivateKey.from_private_bytes(bytes(32)), "did:key:z6MkME")
+    assert posts == ["lobby"]
 
