@@ -61,10 +61,13 @@ def _env(name: str, default: str = "") -> str:
 
 
 def _env_num(name: str, default: float) -> float:
+    """Số từ biến môi trường; rác hoặc không hữu hạn ('nan', 'inf') -> mặc định. `nan` từng TẮT trần chi: mọi phép so
+    với nan đều sai, nên `day_cap > 0` không bao giờ đúng."""
     try:
-        return float(_env(name) or default)
+        v = float(_env(name) or default)
     except ValueError:
         return float(default)
+    return v if math.isfinite(v) else float(default)
 
 
 def base_url() -> str:
@@ -171,31 +174,42 @@ def wallet_address(key) -> str:
 
 # --- két bearer: AES-GCM, khoá HKDF từ khoá agent ---------------------------------------
 
-def _vault_key(agent_key) -> bytes:
+def _vault_key(agent_key, info: bytes = _VAULT_INFO) -> bytes:
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
-                info=_VAULT_INFO).derive(_raw_priv(agent_key))
+                info=info).derive(_raw_priv(agent_key))
 
 
-def seal_bearer(agent_key, bearer: str) -> dict:
+def seal_secret(agent_key, text: str, info: bytes) -> dict:
+    """Mã hoá AES-GCM một bí mật để cất trong state.json (Actions cache — workflow PR của repo công khai đọc được).
+    Khoá dẫn xuất HKDF từ khoá agent, tách theo mục đích (`info`)."""
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     nonce = os.urandom(12)
-    ct = AESGCM(_vault_key(agent_key)).encrypt(nonce, bearer.encode("utf-8"), _VAULT_INFO)
+    ct = AESGCM(_vault_key(agent_key, info)).encrypt(nonce, text.encode("utf-8"), info)
     return {"n": base64.b64encode(nonce).decode(), "c": base64.b64encode(ct).decode()}
 
 
-def open_bearer(agent_key, blob):
-    """Bearer đã giải mã, hoặc None (thiếu/hỏng/khoá khác — vd bản fork, bản giả)."""
+def open_secret(agent_key, blob, info: bytes):
+    """Bí mật đã giải mã, hoặc None (thiếu/hỏng/khoá khác — vd bản fork, bản giả)."""
     if not isinstance(blob, dict) or agent_key is None:
         return None
     try:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        pt = AESGCM(_vault_key(agent_key)).decrypt(
-            base64.b64decode(blob["n"]), base64.b64decode(blob["c"]), _VAULT_INFO)
+        pt = AESGCM(_vault_key(agent_key, info)).decrypt(
+            base64.b64decode(blob["n"]), base64.b64decode(blob["c"]), info)
         return pt.decode("utf-8")
     except Exception:
         return None
+
+
+def seal_bearer(agent_key, bearer: str) -> dict:
+    return seal_secret(agent_key, bearer, _VAULT_INFO)
+
+
+def open_bearer(agent_key, blob):
+    """Bearer đã giải mã, hoặc None (thiếu/hỏng/khoá khác — vd bản fork, bản giả)."""
+    return open_secret(agent_key, blob, _VAULT_INFO)
 
 
 # --- HTTP -------------------------------------------------------------------------------
@@ -504,6 +518,33 @@ def usage_cost(usage, price_prompt: float, price_completion: float, price_reques
         return None
     c = price_request + max(0, pt) * price_prompt + max(0, ct) * price_completion
     return round(c, 9) if c > 0 else None
+
+
+# Tỉ lệ "gateway trừ / token × giá catalog" chấp nhận được: [1/R, R]. Ngoài khoảng = đơn vị giá hiểu sai (vd catalog
+# tính theo 1K token -> lệch ~1000 lần). Số trừ suy từ QUOTA TỤT gồm cả phần giữ chỗ (devnet 2026-11-04: quota tụt 10,
+# token × giá 0.72 -> ~14 lần) nên dùng khoảng rộng hơn QUOTA_RATIO_SLACK lần; số `cost_flop` gateway báo thì không.
+DEFAULT_PRICE_RATIO_MAX = 10.0
+QUOTA_RATIO_SLACK = 10.0
+EMPTY_STREAK_MAX = 3                  # số lần gọi LIỀN trả phí mà không có câu trả lời -> dừng mua
+EMPTY_BACKOFF_SEC = 3600
+
+
+def price_ratio_ok(ratio, src: str = "usage") -> bool:
+    """Tỉ lệ trừ/giá nằm trong [1/R, R] với R = FLOP_GATEWAY_PRICE_RATIO_MAX (mặc định 10; <= 1 hoặc 0 = tắt kiểm tra),
+    nhân QUOTA_RATIO_SLACK khi số trừ suy từ quota tụt (`src` = "quota")."""
+    lim = _env_num("FLOP_GATEWAY_PRICE_RATIO_MAX", DEFAULT_PRICE_RATIO_MAX)
+    if lim <= 1:
+        return True
+    if src == "quota":
+        lim *= QUOTA_RATIO_SLACK
+    r = _num(ratio)
+    return r is not None and math.isfinite(r) and r > 0 and 1 / lim <= r <= lim
+
+
+def price_mismatch_reason(pm: dict) -> str:
+    return (f"gateway trừ {pm.get('cost')} FLOP ({pm.get('src')}) trong khi token × giá catalog = {pm.get('priced')} "
+            f"(tỉ lệ {pm.get('ratio')}, ngoài khoảng cho phép FLOP_GATEWAY_PRICE_RATIO_MAX) — đơn vị giá có thể "
+            "hiểu sai; DỪNG mua tới khi đặt FLOP_GATEWAY_FIXED_PRICE / nới FLOP_GATEWAY_PRICE_RATIO_MAX")
 
 
 def is_overloaded(e) -> bool:
@@ -824,12 +865,16 @@ _LAG_HINTS = {
     "attribution_hold": "đang dừng mua: chain chưa xác nhận chi tiêu đứng tên ví mình",
     "unknown_outcome": "request timeout/mất kết nối — không rõ server đã trừ tiền chưa, đang giữ để đối soát",
     "reconciling": "đang chờ biên nhận của request treo trước khi gọi mới (tối đa 30 phút)",
+    "price_mismatch": "gateway trừ lệch xa token × giá catalog — đang dừng mua (FLOP_GATEWAY_PRICE_RATIO_MAX)",
+    "empty_answer": "nhiều lần gọi liền trả phí mà không có câu trả lời — đang nghỉ",
     "error": "lỗi khác — xem dòng [gateway] lý do",
 }
 
 
-# Lý do tụt lại nằm NGOÀI tầm agent: vẫn in dòng log, không gửi Telegram (không có gì để sửa).
-LAG_SILENT = frozenset({"overloaded"})
+# Lý do tụt lại KHÔNG cần tin này: vẫn in dòng log, không gửi Telegram. `overloaded` nằm ngoài tầm agent (không có
+# gì để sửa); `attribution_hold` đã có tin riêng ("⛔ Đã DỪNG mua compute", nhắc mỗi 24h) — gửi thêm "chi tụt lại"
+# là hai tin cho cùng một việc, và tụt lại khi cổng đứng tên đang dừng là ĐÚNG ý cổng.
+LAG_SILENT = frozenset({"overloaded", "attribution_hold", "price_mismatch", "empty_answer"})
 
 
 def lag_status(g: dict, now: int, outcome: str, *, pct: float, alert_hours: float,
@@ -950,6 +995,16 @@ def _fb_charge(g: dict, fb: dict, amount: float) -> None:
     g["flop_budget"] = {k: v for k, v in fb.items() if k != "avail"}
 
 
+def _fb_hold(g: dict, fb: dict) -> None:
+    """Lần gọi KHÔNG RÕ kết quả: tạm trừ mức tối đa (`max_cost`) vào ngân sách và ghi lại khoản tạm vào request
+    treo, để khi phát lại lấy được chi phí thật thì THAY khoản tạm (không cộng hai lần)."""
+    inf = g.get("inflight") if isinstance(g.get("inflight"), dict) else {}
+    amt = max(0.0, float(inf.get("max_cost") or 0))
+    _fb_charge(g, fb, amt)
+    if inf:
+        inf["fb_held"] = round(float(inf.get("fb_held") or 0) + amt, 9)
+
+
 def _avail_out(fb):
     """Ngân sách FLOP còn lại để báo (None khi quota tính bằng FLOP)."""
     if fb is None:
@@ -975,7 +1030,7 @@ def profile_of(expect_network: str) -> str:
 def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_network: str,
              book_fn=None, sleep=time.sleep, log=print, rng=None, deadline=None,
              clock=time.time, answer_fn=None, checkpoint=None, new_key=None,
-             channel_fn=None, gate=None, after_book=None, probe=None) -> dict:
+             channel_fn=None, gate=None, after_book=None, probe=None, spend_room=None) -> dict:
     """Một nhịp mua compute. Trả {"outcome", "calls", "spent", ...}; KHÔNG ném lỗi.
 
     `book_fn(amount, ref, model)` ghi sổ (chỉ khi mạng khớp `expect_network`); None = chạy
@@ -1003,7 +1058,10 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
     không có miner). Kết quả có `miners` và `foreign_channels` = số kênh KHÔNG đứng tên ví mình.
 
     Quota gateway là FLOP (flop.network/llms.txt). FLOP_GATEWAY_BUDGET_FLOP > 0 -> nhịp chi rải theo
-    ngân sách đó thay vì cả quota (xem _flop_budget); trần ngày vẫn là FLOP_GATEWAY_MAX_PER_DAY."""
+    ngân sách đó thay vì cả quota (xem _flop_budget); trần ngày vẫn là FLOP_GATEWAY_MAX_PER_DAY.
+
+    `spend_room()` -> FLOP còn được chi hôm nay dưới trần CHUNG của mọi đường mua (None = không có), đọc một lần trước
+    khi định phần đến hạn; <= 0 -> `daily_cap`."""
     import uuid
     new_key = new_key or (lambda: str(uuid.uuid4()))
     t0 = clock()                             # mốc đồng hồ đầu lượt: giờ gửi = now + (clock() - t0)
@@ -1338,14 +1396,18 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
                     waiting.pop(k, None)
                 if a is None or k in seen:
                     continue
-                seen.append(k)
-                new.append(rc)
-                amt += a
                 if book_fn and a > 0:
-                    book_fn(a, k[:80], str(rc.get("model") or model_id))
+                    br = book_fn(a, k[:80], str(rc.get("model") or model_id))
+                    if isinstance(br, dict) and br.get("outcome") == "save_failed":
+                        # Sổ không ghi được: KHÔNG đánh dấu đã thấy — lượt sau ghi lại (chống trùng ở sổ).
+                        log(f"[gateway] ⚠️ không ghi được sổ cho biên nhận {k[:12]}… — thử lại lượt sau")
+                        continue
                 elif book_fn:
                     log(f"[gateway] ⚠️ biên nhận {k[:12]}… đã settle nhưng không có số tiền "
                         f"(keys: {sorted(rc)[:10]})")
+                seen.append(k)
+                new.append(rc)
+                amt += a
             # /keys/me/receipts không phân trang: biên nhận rời phản hồi khi chưa settle thì không
             # còn đọc được số tiền. Không ghi sổ theo ước tính — đếm và báo để đối soát tay.
             if odd:
@@ -1415,7 +1477,8 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
                     "implausible_new": len(fresh_bad), "pre_enroll_skipped": pre,
                     "receipts_total": st["receipts"], "settled_total": st["settled"],
                     "miners": miners, "channel_agents": agents,
-                    "foreign_channels": sum(foreign.values())}
+                    "foreign_channels": sum(foreign.values()),
+                    "own_channels": sum(n for a, n in agents.items() if same_account(a, addr))}
 
         # Đọc biên nhận TRƯỚC khi gọi: biên nhận settle muộn (của các run trước) luôn được ghi,
         # kể cả khi lần gọi run này lỗi (429/503) hay chưa tới nhịp.
@@ -1484,6 +1547,9 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
                     usage = r.get("usage") if isinstance(r.get("usage"), dict) else {}
                     cost = _cost(usage.get("cost_flop")) or drop or usage_cost(usage, *_price(model)) or 0.0
                     if fb is not None:
+                        # Đã tạm trừ `fb_held` ở lượt lỗi: thay bằng chi phí thật, không cộng thêm.
+                        held = max(0.0, float(inf.get("fb_held") or 0))
+                        fb["spent"] = round(max(0.0, float(fb.get("spent") or 0) - held), 9)
                         _fb_charge(g, fb, cost or float(inf.get("max_cost") or 0))
                     if inf.get("day_held"):
                         unhold_day(inf["day_held"], cost)    # đã tạm tính ở lượt lỗi: thay, không cộng
@@ -1567,10 +1633,30 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
         run_cap = _env_num("FLOP_GATEWAY_MAX_PER_RUN", DEFAULT_MAX_PER_RUN)
         day_cap = _env_num("FLOP_GATEWAY_MAX_PER_DAY", DEFAULT_MAX_PER_DAY)
         charge_day(0)                                      # sang ngày UTC mới -> đếm lại từ 0
+        pm = g.get("price_mismatch") if isinstance(g.get("price_mismatch"), dict) else None
+        if pm and not price_ratio_ok(pm.get("ratio"), pm.get("src") or "usage"):
+            return done("price_mismatch", remaining=remaining, reason=price_mismatch_reason(pm))
+        if pm:
+            log(f"[gateway] bỏ chốt giá lệch (tỉ lệ {pm.get('ratio')}) — FLOP_GATEWAY_PRICE_RATIO_MAX đã nới / tắt")
+            g.pop("price_mismatch", None)
         day_left = day_cap - float(g["day_spent"]["spent"])
         if day_cap > 0 and day_left <= 0:
             return done("daily_cap", due=round(due, 6), remaining=remaining, budget=_avail_out(fb),
                         reason=f"đã chi {g['day_spent']['spent']} FLOP hôm nay, trần {day_cap:g}")
+        room_c = None                                      # trần CHUNG cả hai đường mua (caller tính)
+        if spend_room is not None:
+            try:
+                room_c = spend_room()
+                room_c = None if room_c is None else float(room_c)
+                if room_c is not None and not math.isfinite(room_c):
+                    room_c = 0.0
+            except Exception as e:
+                room_c = 0.0                               # không tính được -> an toàn: không chi lượt này
+                log(f"[gateway] không tính được trần chi chung ({type(e).__name__}) — không chi lượt này")
+            if room_c is not None and room_c <= 0:
+                return done("daily_cap", due=round(due, 6), remaining=remaining, budget=_avail_out(fb),
+                            reason=("chạm trần chi chung mỗi ngày (FLOP_MAX_SPEND_PER_DAY, cả gateway lẫn mua "
+                                    "trực tiếp)"))
         # Rải việc mua như flop_pacer: thỉnh thoảng nghỉ cả lượt và co giãn phần đến
         # hạn ±FLOP_PACE_JITTER_PCT. Phần không chi được TÍCH sang lượt sau (window_due cộng
         # dồn) nên tổng chi trong ngày không đổi. Sát hạn thì không nghỉ, để kịp chi hết.
@@ -1587,6 +1673,8 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
             due = min(due, run_cap)
         if day_cap > 0:
             due = min(due, day_left)
+        if room_c is not None:
+            due = min(due, room_c)
         max_calls = max(1, int(_env_num("FLOP_GATEWAY_MAX_CALLS_PER_RUN", 2)))
         pp, pc, preq = _price(model)
         if pp <= 0 and pc <= 0 and preq <= 0:
@@ -1637,6 +1725,8 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
             due, max_calls = min(float(avail), min_cost * 1.25), 1
             if day_cap > 0:
                 due = min(due, day_left)
+            if room_c is not None:
+                due = min(due, room_c)
             log(f"[gateway] cổng đứng tên đang dừng — mua THĂM DÒ 1 lần nhỏ ({due:.4f} FLOP) để xem chain "
                 "có ghi chi tiêu cho ví mình không")
         if due < min_cost or min_cost <= 0:
@@ -1652,6 +1742,7 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
         n = min(max_calls, max(1, int(due // min_cost)))      # gọi ít mà to, không nhiều mà vụn
         per_call = min(due / n, avail)
         spent, calls, last, quota_now = 0.0, 0, {}, remaining
+        stop = None                                        # lý do dừng vòng gọi giữa chừng (giá lệch / trả lời rỗng)
         for i, prompt in enumerate(pick[:n]):
             if i:
                 est = estimate_or_empty(prompt)
@@ -1673,11 +1764,12 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
             if calls:
                 sleep(gap)
             g["last_mt"] = mt
-            # Trần gửi kèm = giá dự tính của CHÍNH lần gọi này (+10%), không phải cả phần đến hạn.
-            # (OpenAPI chỉ định nghĩa kiểu của max_cost_flop; server có cưỡng chế hay không CHƯA
-            # được kiểm chứng.)
+            # Trần gửi kèm = giá dự tính của CHÍNH lần gọi này (+10%), nhưng KHÔNG quá phần chia cho lần gọi
+            # (per_call <= phần đến hạn / số lần gọi, mà phần đến hạn đã kẹp theo trần lượt / trần ngày / trần
+            # chung / hạn mức cổng đứng tên). Trước đây ×1.1 SAU khi lấy min -> vượt các trần đó tới 10%.
+            # (OpenAPI chỉ định nghĩa kiểu của max_cost_flop; server có cưỡng chế hay không CHƯA được kiểm chứng.)
             est_cost = preq + ptok * pp + mt * pc
-            max_cost = min(per_call, est_cost) * 1.1
+            max_cost = min(per_call, est_cost * 1.1)
             pending = new_key()
             # Đủ để phát lại ĐÚNG thân request nếu không nhận được phản hồi.
             # `sent` = giờ gửi THẬT (now + thời gian đã trôi trong lượt) để đối soát theo giờ (match_inflight);
@@ -1720,6 +1812,12 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
                 g["charged_vs_priced"] = round(cost / priced, 4)
                 log(f"[gateway] gateway trừ {cost:.6g} FLOP ({src}); token × giá = {priced:.6g} "
                     f"→ tỉ lệ {g['charged_vs_priced']:g}")
+                if not price_ratio_ok(cost / priced, src):
+                    # Đơn vị giá lệch (vd giá theo 1K token): mọi phép định cỡ lần gọi, trần gửi kèm và nhịp chi đều
+                    # sai cùng tỉ lệ. Dừng mua (giữ tới khi operator xử lý) thay vì chỉ in log.
+                    g["price_mismatch"] = {"ts": now, "ratio": round(cost / priced, 6), "cost": round(cost, 9),
+                                           "priced": round(priced, 9), "src": src}
+                    stop = "price_mismatch"
             if fb is not None:
                 _fb_charge(g, fb, cost or per_call)
             calls += 1
@@ -1734,6 +1832,17 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
                     log(f"[gateway] bỏ qua lỗi khi lưu câu trả lời ({str(e)[:80]})")
             last = {"id": r.get("id"), "tokens": u.get("completion_tokens"), "cost": cost,
                     "src": src, "gflops": u.get("gflops_used"), "quota_delta": delta}
+            # Trả tiền mà KHÔNG có câu trả lời: đếm liên tiếp; tới EMPTY_STREAK_MAX thì dừng mua một giờ.
+            if answer_text(r):
+                g.pop("empty_streak", None)
+            else:
+                g["empty_streak"] = int(g.get("empty_streak") or 0) + 1
+                out["empty_answers"] = int(out.get("empty_answers") or 0) + 1
+                last["empty"] = True
+                log(f"[gateway] ⚠️ lần gọi {r.get('id') or '?'} trả phí {cost:.6g} FLOP mà KHÔNG có nội dung trả lời "
+                    f"({g['empty_streak']} lần liền)")
+                if g["empty_streak"] >= EMPTY_STREAK_MAX:
+                    stop = stop or "empty_answer"
             if cost <= 0:
                 # Không có cost_flop lẫn quota giảm -> KHÔNG ghi sổ theo ước tính; in khoá thật.
                 last["usage_keys"] = sorted(u)[:10]
@@ -1746,11 +1855,20 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
             # Ghi tiến độ NGAY sau mỗi lần chi: lỗi ở lần gọi sau không làm mất số đã chi.
             g["remaining"] = _quota_left(fb, quota_now, remaining, spent)
             g["window"] = {**g["window"], "spent": float(g["window"].get("spent") or 0) + cost}
-            if spent >= due - 1e-9 or spent >= avail:
+            if stop or spent >= due - 1e-9 or spent >= avail:
                 break
         tally(calls, spent)
         g["last"] = last
         g["remaining"] = _quota_left(fb, quota_now, remaining, spent)
+        if stop == "price_mismatch":
+            pm = g["price_mismatch"]
+            return done("price_mismatch", calls=calls, spent=round(spent, 6), remaining=g["remaining"], last=last,
+                        reason=price_mismatch_reason(pm))
+        if stop == "empty_answer":
+            backoff(EMPTY_BACKOFF_SEC, "empty_answers")
+            return done("empty_answer", calls=calls, spent=round(spent, 6), remaining=g["remaining"], last=last,
+                        reason=(f"{g['empty_streak']} lần gọi liền trả phí mà không có câu trả lời — dừng mua "
+                                f"{EMPTY_BACKOFF_SEC // 60} phút"))
         return done("spent" if calls else "pace_wait", calls=calls, spent=round(spent, 6),
                     due=round(due, 6), remaining=g["remaining"], budget=_avail_out(fb),
                     model=model_id, last=last)
@@ -1769,7 +1887,7 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
             tally(calls, spent, n_sent=calls + 1)
             hold_day()
             if fb is not None:
-                _fb_charge(g, fb, float((g.get("inflight") or {}).get("max_cost") or 0))
+                _fb_hold(g, fb)
             backoff(unknown_backoff_sec(g.get("inflight")), f"{e.status} {e.code}")
             return done("unknown_outcome",
                         reason=(f"HTTP {e.status} khi chờ phản hồi — có thể server đã xử lý và trừ tiền; "
@@ -1826,6 +1944,8 @@ def run_step(state: dict, *, agent_key, http, now: int, prompts: list, expect_ne
             tally(calls, spent, n_sent=calls + unknown)
         if unknown:
             hold_day()
+            if fb is not None:
+                _fb_hold(g, fb)
         backoff(unknown_backoff_sec(g.get("inflight")) if unknown else 900, type(e).__name__)
         if unknown:
             return done("unknown_outcome",

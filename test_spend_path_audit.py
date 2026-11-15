@@ -1,6 +1,7 @@
 """Hồi quy từ audit đường chi tiêu 2026-10-31: mỗi test ứng với một lỗi đã tái hiện bằng gateway giả."""
 import json
 import os
+from decimal import Decimal
 
 import pytest
 
@@ -998,7 +999,7 @@ def test_gate_probes_once_per_interval_while_holding(monkeypatch, telegram):
     assert _run_at(monkeypatch, st, NOW) == "attribution_hold"
     assert _run_at(monkeypatch, st, NOW + 3 * 3600) == "attribution_hold" and srv.chats == []
     assert _run_at(monkeypatch, st, NOW + 6 * 3600) == "spent" and len(srv.chats) == 1    # lượt thăm dò
-    assert st[ac.ATTRIB_PROBE_KEY] == {"at": NOW + 6 * 3600, "pend": "30", "chain": 0.0}
+    assert st[ac.ATTRIB_PROBE_KEY] == {"at": NOW + 6 * 3600, "pend": "30", "chain": 0.0, "direct": 0.0}
     assert _run_at(monkeypatch, st, NOW + 6 * 3600 + 300) == "attribution_hold" and len(srv.chats) == 1
     assert _run_at(monkeypatch, st, NOW + 12 * 3600) == "spent" and len(srv.chats) == 2
     assert st[ac.ATTRIB_PROBE_KEY]["chain"] == 0.0                         # giữ mốc của lượt đầu
@@ -1025,7 +1026,15 @@ def test_probe_also_covers_room_smaller_than_one_call(monkeypatch, telegram):
     assert _run_at(monkeypatch, st, NOW + 6 * 3600) == "spent" and len(srv.chats) == 1
 
 
+def _own_channels(monkeypatch, own=True):
+    """Explorer: kênh của biên nhận gateway đứng tên ví mình (own) hoặc broker."""
+    me = fg.wallet_address(fg.wallet_key(KEY))
+    broker = fg.ss58_encode(bytes([5]) * 32)
+    monkeypatch.setattr(ac, "channel_info", lambda net, cid: {"agent": me if own else broker, "miner": "5M"})
+
+
 def test_probe_seen_on_chain_writes_off_foreign_spend_and_reopens_the_gate(monkeypatch, telegram):
+    _own_channels(monkeypatch)                                              # kênh thăm dò đứng tên ví mình
     st, srv = _held(monkeypatch)
     st[ac.FOREIGN_SEEN_KEY] = NOW - 100
     _run_at(monkeypatch, st, NOW)
@@ -1557,3 +1566,221 @@ def test_surplus_is_measured_against_the_ledger_not_double_counted():
     assert tm.gateway_attribution()["unattributed"] == 0
     assert ac.attribution_room(st, NOW) == pytest.approx(30 - 10)      # chain = sổ: không dư, chờ 10 nguyên
 
+
+
+# --- chi MUA TRỰC TIẾP không được đọc thành "gateway đã đứng tên ví mình" ------------------------------------------
+
+def _direct_pending(st, *escrows, net="testnet"):
+    import flop_direct
+    st[flop_direct.KEY] = {"pending": [{"channel": "0x" + f"{i + 1:064x}", "ts": NOW, "network": net,
+                                        "max_flop": str(e)} for i, e in enumerate(escrows)]}
+
+
+def test_unbooked_direct_spend_does_not_confirm_gateway_pending(monkeypatch):
+    tm.credit("3000")
+    tm.record_gateway_spend("20", "inference-session gateway m", "broker-1")
+    tm.confirm_gateway_attribution("0", chain_id="0xaa")
+    st = {flop_radar.KEY: _chain_read(495 * 10 ** 17)}                # chain ghi THỰC TRẢ 49.5 (escrow 50) — trực tiếp
+    _direct_pending(st, "50")
+    assert ac.gateway_attribution_step(st, NOW) in ("ok", "MISMATCH")
+    assert tm.gateway_attribution()["unattributed"] == Decimal("20")   # KHÔNG xác nhận nhầm
+    tm.record_direct_spend("49.5", "inference-session direct m", "0x" + f"{1:064x}")   # lượt sau: kênh PAID
+    st[flop_direct_key()] = {"pending": []}
+    ac.gateway_attribution_step(st, NOW + 300)
+    led = tm.load_ledger()
+    assert tm.gateway_attribution()["unattributed"] == Decimal("20") and led["session_cumulative"]["FLOP"] == "49.5"
+
+
+def flop_direct_key():
+    import flop_direct
+    return flop_direct.KEY
+
+
+def test_gateway_confirmation_still_counts_real_gateway_growth_next_to_direct(monkeypatch):
+    tm.credit("3000")
+    tm.record_gateway_spend("20", "inference-session gateway m", "g-1")
+    tm.record_direct_spend("100", "inference-session direct m", "0x" + f"{7:064x}")
+    st = {flop_radar.KEY: _chain_read(120 * 10 ** 18)}                 # 100 trực tiếp (đã ghi) + 20 gateway
+    assert ac.gateway_attribution_step(st, NOW) == "ok"
+    assert tm.gateway_attribution()["unattributed"] == Decimal("0")
+
+
+def test_pending_direct_escrow_never_looks_like_a_chain_reset():
+    tm.credit("3000")
+    tm.record_gateway_spend("30", "inference-session gateway m", "g-1")
+    tm.record_direct_spend("1000", "inference-session direct m", "0x" + f"{8:064x}")
+    for i in range(5):                                                 # mỗi lượt: phiên trực tiếp mới chờ ghi sổ
+        st = {flop_radar.KEY: _chain_read(int((1000 + 99 * (i + 1)) * 10 ** 18), at=NOW + i)}
+        _direct_pending(st, *(["100"] * (i + 1)))
+        assert tm.confirm_gateway_attribution(1000 + 99 * (i + 1), chain_id=None, read_at=NOW + i,
+                                              exclude=str(100 * (i + 1)))["outcome"] in ("no_change", "confirmed")
+    led = tm.load_ledger()
+    assert led["gateway_unattributed"]["FLOP"] == "30" and not led.get("gateway_chain_low", {}).get("FLOP")
+
+
+def test_direct_spend_does_not_open_the_gateway_gate(monkeypatch):
+    tm.credit("5000")
+    for i in range(5):
+        tm.record_gateway_spend("100", "inference-session gateway m", f"b-{i}")
+    tm.record_direct_spend("1000", "inference-session direct m", "0x" + f"{9:064x}")
+    st = {flop_radar.KEY: _chain_read(1000 * 10 ** 18)}
+    assert ac.attribution_room(st, NOW) <= 0 and ac.attribution_hold(st, NOW)
+    _direct_pending(st, "200")                                         # còn kênh trực tiếp chờ: vẫn đóng
+    st[flop_radar.KEY] = _chain_read(1198 * 10 ** 18)
+    assert ac.attribution_room(st, NOW) <= 0
+
+
+def test_probe_result_ignores_direct_growth(monkeypatch, telegram):
+    tm.credit("5000")
+    tm.record_gateway_spend("500", "inference-session gateway m", "b-1")
+    st = {ac.ATTRIB_PROBE_KEY: {"at": NOW, "pend": "500", "chain": 1000.0, "direct": 1000.0},
+          ac.FOREIGN_SEEN_KEY: 3, ac.OWN_SEEN_KEY: NOW + 1}
+    tm.record_direct_spend("1000", "inference-session direct m", "0x" + f"{10:064x}")
+    tm.record_direct_spend("80", "inference-session direct m", "0x" + f"{11:064x}")   # phiên trực tiếp sau mốc
+    ac._attrib_probe_result(st, NOW + 600, 1080.0)
+    assert tm.gateway_attribution()["unattributed"] == Decimal("500") and st[ac.FOREIGN_SEEN_KEY] == 3
+    ac._attrib_probe_result(st, NOW + 900, 1080.05)                   # +0.05 không phải trực tiếp: lượt thăm dò
+    assert tm.gateway_attribution()["unattributed"] == Decimal("0") and st[ac.FOREIGN_SEEN_KEY] == 0
+
+
+def test_direct_epoch_resets_with_the_chain_epoch():
+    tm.credit("3000")
+    tm.record_direct_spend("100", "inference-session direct m", "0x" + f"{12:064x}")
+    tm.confirm_gateway_attribution("100", chain_id="0xaa")
+    assert tm.direct_epoch_done() == Decimal("100")
+    tm.confirm_gateway_attribution("5", chain_id="0xbb")               # genesis đổi: kỳ mới
+    assert tm.direct_epoch_done() == Decimal("0")
+
+
+def test_direct_epoch_is_mirrored_to_kv(monkeypatch):
+    tm.credit("100")
+    tm.record_direct_spend("10", "inference-session direct m", "0x" + f"{13:064x}")
+    sent = []
+    monkeypatch.setattr(ac, "kv_set", lambda pk, did, key, val: sent.append(val) or True)
+    ac.persist_ledger_to_kv(None, "did:x")
+    assert sent and "direct_epoch_done" in sent[-1]
+
+
+def test_gateway_ledger_save_failure_keeps_the_receipt_unseen(monkeypatch):
+    real, broken = tm._save_ledger, [True]
+    monkeypatch.setattr(tm, "_save_ledger", lambda state, path=None: False if broken[0] else real(state, path))
+    st, srv = fresh(), Srv()
+    srv.receipts = [rc("r-save", spend=6.5)]
+    step(st, srv)
+    assert tm.load_ledger().get("gateway_unattributed", {}).get("FLOP") in (None, "0")
+    assert "r-save" not in str(st[fg.KEY].get("receipts_seen"))
+    broken[0] = False
+    step(st, srv, now=NOW + 300)
+    assert tm.gateway_attribution()["unattributed"] == Decimal("6.5")
+
+
+def test_record_gateway_spend_reports_a_failed_save(monkeypatch):
+    monkeypatch.setattr(tm, "_save_ledger", lambda state, path=None: False)
+    assert tm.record_gateway_spend("1", "inference-session gateway m", "x")["outcome"] == "save_failed"
+
+
+# --- làm tròn: sổ không được vượt chain vì float; kênh mồ côi giữ chỗ cho cổng gateway ------------------------------
+
+def test_direct_amounts_are_exact_decimals():
+    import flop_direct
+    kind, amt = flop_direct.classify_channel(
+        {"agent": "5Me", "status": "settled", "paymentStatus": "PAID", "observationHead": "finalized",
+         "minerPaid": "98956627838640000001", "burned": "0"}, "5Me")
+    assert kind == "paid" and amt == Decimal("98.956627838640000001")
+
+
+def test_rounding_noise_is_not_a_low_reading_and_never_resets_the_chain_epoch():
+    tm.credit("1000")
+    tm.record_gateway_spend("19.5", "inference-session gateway m", "g-1")
+    for i, a in enumerate((98.993664, 98.956627838640, 98.956627838640)):    # float như trước khi sửa
+        tm.record_direct_spend(a, "inference-session direct m", "0x" + f"{100 + i:064x}")
+    exact = Decimal("296.906919677279991888")                                # raw chain chia 1e18
+    for k in range(5):
+        r = tm.confirm_gateway_attribution(exact, read_at=NOW + k)
+        assert r["outcome"] in ("no_change", "confirmed") and r["outcome"] != "low_reading"
+    led = tm.load_ledger()
+    assert led["gateway_unattributed"]["FLOP"] == "19.5" and not led.get("gateway_chain_low", {}).get("FLOP")
+    assert tm.direct_epoch_done() > 0                                         # kỳ không bị mở lại
+
+
+def test_real_low_readings_still_detect_a_reset():
+    tm.credit("1000")
+    tm.record_direct_spend("100", "inference-session direct m", "0x" + f"{200:064x}")
+    tm.confirm_gateway_attribution("100", read_at=NOW)
+    outs = [tm.confirm_gateway_attribution("5", read_at=NOW + k)["outcome"] for k in range(1, 4)]
+    assert outs[:2] == ["low_reading", "low_reading"] and tm.direct_epoch_done() == Decimal("0")
+
+
+def test_unknown_outcome_holds_its_escrow_for_the_gateway_gate():
+    import flop_direct
+    st = {flop_direct.KEY: {}}
+    flop_direct._mark_orphan(st[flop_direct.KEY], NOW, "testnet", "99.5")
+    assert st[flop_direct.KEY]["orphan_since"] == NOW
+    assert ac.direct_unbooked(st) == pytest.approx(99.5)
+    flop_direct._mark_orphan(st[flop_direct.KEY], NOW + 10, "devnet", "50")   # mạng khác: không tính
+    assert ac.direct_unbooked(st) == pytest.approx(99.5)
+    view = flop_direct.durable_view(st[flop_direct.KEY])
+    assert view["unknown_escrow"][0][2] == "99.5"                             # sao lưu KV
+
+
+# --- chain reset phát hiện trễ: chi trực tiếp trong lúc chờ thuộc kỳ MỚI ---------------------------------------------
+
+def test_direct_spend_booked_while_detecting_a_reset_moves_to_the_new_epoch():
+    tm.credit("5000")
+    tm.record_direct_spend("500", "inference-session direct m", "0x" + f"{300:064x}")
+    tm.confirm_gateway_attribution("500", read_at=NOW)                      # đọc nhất quán, kỳ cũ = 500
+    tm.record_gateway_spend("20", "inference-session gateway m", "g-x")    # gateway (broker) chờ
+    # chain reset: chain mới ghi 0, rồi các phiên trực tiếp MỚI được ghi sổ trong 3 lần đọc thấp
+    totals = []
+    for k in range(3):
+        tm.record_direct_spend("99", "inference-session direct m", "0x" + f"{400 + k:064x}")
+        totals.append(99 * (k + 1))
+        tm.confirm_gateway_attribution(str(totals[-1]), read_at=NOW + k + 1)
+    led = tm.load_ledger()
+    assert tm.direct_epoch_done() == Decimal("297") and led["gateway_epoch_done"]["FLOP"] == "297"
+    assert tm.gateway_attribution()["unattributed"] == Decimal("20")        # KHÔNG xác nhận nhầm gateway
+
+
+def test_consistent_reading_clears_the_since_ok_counter():
+    tm.credit("1000")
+    tm.record_direct_spend("10", "inference-session direct m", "0x" + f"{500:064x}")
+    assert tm.load_ledger()["direct_since_ok"]["FLOP"] == "10"
+    tm.confirm_gateway_attribution("10", read_at=NOW)
+    assert tm.load_ledger()["direct_since_ok"]["FLOP"] == "0"
+
+
+def test_genesis_change_reset_also_carries_direct_booked_since_the_last_good_read():
+    tm.credit("1000")
+    tm.record_direct_spend("100", "inference-session direct m", "0x" + f"{600:064x}")
+    tm.confirm_gateway_attribution("100", chain_id="0xaa", read_at=NOW)
+    tm.record_gateway_spend("30", "inference-session gateway m", "g-y")
+    tm.record_direct_spend("40", "inference-session direct m", "0x" + f"{601:064x}")    # phiên đầu trên chain mới
+    tm.confirm_gateway_attribution("40", chain_id="0xbb", read_at=NOW + 1)            # genesis đổi: reset ngay
+    assert tm.direct_epoch_done() == Decimal("40") and tm.gateway_attribution()["unattributed"] == Decimal("30")
+
+
+# --- M6: mở lại cổng / xác nhận chỉ khi có bằng chứng THEO KÊNH -------------------------------------------------------
+
+def test_probe_without_own_channel_evidence_keeps_the_gate_closed(monkeypatch, telegram):
+    _own_channels(monkeypatch, own=False)                                   # kênh thăm dò vẫn đứng tên broker
+    st, srv = _held(monkeypatch)
+    st[ac.FOREIGN_SEEN_KEY] = NOW - 100
+    _run_at(monkeypatch, st, NOW)
+    t = NOW + 6 * 3600
+    assert _run_at(monkeypatch, st, t) == "spent"
+    srv.receipts = [rc("probe", spend=0.05, created_at=t * 1000)]
+    _run_at(monkeypatch, st, t + 300)
+    st[flop_radar.KEY] = _chain_read(5 * 10 ** 16, at=t + 600)             # chain +0.05 cho ví — từ nguồn khác
+    ac.gateway_attribution_step(st, t + 600)
+    led = tm.load_ledger()
+    assert "gateway_written_off" not in led and ac.ATTRIB_PROBE_KEY in st
+    assert tm.gateway_attribution()["attributed"] == 0                      # không xác nhận theo tổng
+    assert ac.attribution_hold(st, t + 600) is not None
+
+
+def test_own_channel_evidence_is_recorded_from_receipt_lookups(monkeypatch, telegram):
+    _own_channels(monkeypatch)
+    st, srv = _held(monkeypatch)
+    srv.receipts = [rc("mine", created_at=NOW * 1000)]
+    _run_at(monkeypatch, st, NOW)
+    assert st[ac.OWN_SEEN_KEY] == NOW

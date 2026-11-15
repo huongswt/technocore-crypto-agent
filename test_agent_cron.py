@@ -4737,3 +4737,147 @@ def test_engage_asks_the_peer_in_the_room_they_spoke_in(monkeypatch):
     ac.auto_respond(Ed25519PrivateKey.from_private_bytes(bytes(32)), "did:key:z6MkME")
     assert posts == ["lobby"]
 
+
+
+
+def test_every_documented_flop_variable_is_mapped_by_the_workflow():
+    """README liệt kê một biến FLOP_/TESTNET_ là cấu hình (Repo Variable) mà workflow không truyền -> operator đặt
+    Variable, agent không bao giờ thấy (đã xảy ra với FLOP_KIBBLE_MAX_CHARS và hai núm tclk). Hàng README dạng
+    `| `NAME` / `_SUFFIX` | ...`: hậu tố thay phần cuối của tên đầu."""
+    import re as _re
+    readme = open("README.md", encoding="utf-8").read()
+    wf = open(".github/workflows/agent_cron.yml", encoding="utf-8").read()
+    mapped = set(_re.findall(r"^\s+([A-Z][A-Z0-9_]+):\s*\$\{\{", wf, _re.M))
+    code = "".join(open(f, encoding="utf-8").read() for f in __import__("glob").glob("*.py") if not f.startswith("test_"))
+    names = set()
+    for first, rest in _re.findall(r"^\| `([A-Z][A-Z0-9_]+)`((?: / `_?[A-Z0-9_]+`)*)", readme, _re.M):
+        names.add(first)
+        parts = first.split("_")
+        for suf in _re.findall(r"`(_?[A-Z0-9_]+)`", rest):
+            names.update("_".join(parts[:i]) + suf for i in range(1, len(parts))) if suf.startswith("_") else names.add(suf)
+    real = {n for n in names if n.startswith(("FLOP_", "TESTNET_")) and f'"{n}"' in code}
+    not_for_actions = {"FLOP_DIRECT_CLI",   # CLI cục bộ cho máy KHÔNG có Docker (VPS); Actions chạy image Docker
+                       "FLOP_TX_UA",        # User-Agent của adapter mempool cũ — bị chặn trên testnet
+                       "FLOP_TCLK_X402_ENABLED"}   # rail x402 chưa nối trong agent_cron (submit_fn/read_fn = None)
+    assert sorted(real - mapped - not_for_actions) == []
+
+
+# ── sổ testnet ĐẦY (200 dấu ghi sổ + bảng giờ/ngày) vượt 8192 ngay cả khi bỏ hết entries ──────────────────────────────
+def _full_ledger():
+    import hashlib
+    D = "1438.884426459635942436545638"
+    days = [f"2026-11-{d:02d}" for d in range(8, 15)]
+    hours = [f"2026-11-14T{h:02d}" for h in range(24)] + ["2026-11-13T23"]
+    return {"balances": {"FLOP": D}, "spent_cumulative": {"FLOP": D},
+            "spent_by_day": {"FLOP": {d: D for d in days}}, "session_by_day": {"FLOP": {d: D for d in days}},
+            "spend_count_by_hour": {"FLOP": {h: 15 for h in hours}},
+            "credit_by_hour": {"FLOP": {h: [D, 3] for h in hours}},
+            "gateway_refs": [hashlib.sha256(f"g{i}".encode()).hexdigest()[:16] for i in range(100)],
+            "direct_refs": [hashlib.sha256(f"d{i}".encode()).hexdigest()[:16] for i in range(100)],
+            **{k: {"FLOP": D} for k in ("gateway_unattributed", "gateway_attributed", "gateway_written_off",
+                                        "direct_attributed", "direct_epoch_done", "gateway_epoch_done",
+                                        "gateway_chain_hw", "gateway_chain_low", "session_cumulative")},
+            "entries": [{"kind": "spend", "token": "FLOP", "amount": D, "ts": "x", "memo": "m" * 60}] * 40}
+
+
+def test_oversized_ledger_still_snapshots_and_trims_gateway_refs_for_kv(tmp_path, monkeypatch):
+    """Trước: bản không entries vẫn > 8192 -> hàm thoát TRƯỚC khi lưu bản sao state.json -> cả hai bản bền ngừng cập
+    nhật, mỗi run sổ tua về bản cũ (dấu biên nhận mất -> ghi sổ trùng). Nay: bản sao luôn lưu đủ; KV bớt dấu gateway."""
+    import token_manager as tm
+    monkeypatch.setenv("TOKEN_LEDGER_FILE", str(tmp_path / "led.json"))
+    monkeypatch.setattr(ac, "STATE_FILE", str(tmp_path / "state.json"))
+    led = _full_ledger()
+    tm.save_ledger(led)
+    pk = _real_key()
+    sent = {}
+    monkeypatch.setattr(ac, "kv_set", lambda p, did, k, v: sent.update({k: v}) or True)
+    ac.persist_ledger_to_kv(pk, ac.did_of(pk))
+    snap = json.load(open(tmp_path / "state.json", encoding="utf-8"))[ac._ledger_snapshot_key()]
+    assert snap["gateway_refs"] == led["gateway_refs"] and snap["direct_refs"] == led["direct_refs"]
+    raw = sent[ac._ledger_kv_key()]
+    assert len(raw) <= ac.KV_VALUE_MAX
+    body = ac._kv_open(raw, pk, ac._ledger_kv_key())
+    assert body["direct_refs"] == led["direct_refs"]                          # dấu kênh trực tiếp giữ đủ
+    assert body["gateway_refs"] == led["gateway_refs"][-len(body["gateway_refs"]):]   # giữ các dấu MỚI nhất
+    assert len(body["gateway_refs"]) >= ac.LEDGER_KV_GATEWAY_REFS_MIN
+
+
+def test_snapshot_is_saved_even_when_nothing_fits_kv(tmp_path, monkeypatch):
+    import token_manager as tm
+    monkeypatch.setenv("TOKEN_LEDGER_FILE", str(tmp_path / "led.json"))
+    monkeypatch.setattr(ac, "STATE_FILE", str(tmp_path / "state.json"))
+    led = _full_ledger()
+    led["gateway_chain_id"] = {f"T{i}": "x" * 64 for i in range(200)}          # quá cỡ dù đã cắt mọi thứ
+    tm.save_ledger(led)
+    sent = {}
+    monkeypatch.setattr(ac, "kv_set", lambda p, did, k, v: sent.update({k: v}) or True)
+    ac.persist_ledger_to_kv(_real_key(), "did")
+    assert sent == {}
+    snap = json.load(open(tmp_path / "state.json", encoding="utf-8"))[ac._ledger_snapshot_key()]
+    assert snap["balances"] == led["balances"] and len(snap["gateway_refs"]) == 100
+
+
+def test_hydrate_unions_refs_from_a_trimmed_kv_and_the_full_snapshot(monkeypatch):
+    """KV (đã bớt dấu gateway, đi xa hơn) thắng bản sao state.json; dấu chỉ có ở bản sao vẫn phải được giữ, không thì
+    biên nhận cũ còn trong cửa sổ 20 cái bị ghi sổ lần hai."""
+    import token_manager as tm
+    full = _led("80", "20")
+    full["gateway_refs"] = [f"g{i:015d}" for i in range(100)]
+    full["direct_refs"] = [f"d{i:015d}" for i in range(30)]
+    kv = _led("79", "21")
+    kv["gateway_refs"] = full["gateway_refs"][-40:] + ["gNEW00000000000"]
+    kv["direct_refs"] = full["direct_refs"]
+    pk = _real_key()
+    monkeypatch.setattr(ac, "kv_get", lambda k: ac._kv_seal(pk, kv, ac._ledger_kv_key()))
+    monkeypatch.setattr(tm, "load_ledger", lambda *a, **k: {"balances": {}, "entries": []})
+    saved = []
+    monkeypatch.setattr(tm, "save_ledger", lambda led, *a, **k: saved.append(led))
+    ac.hydrate_ledger_from_kv({ac._ledger_snapshot_key(): full}, pk)
+    assert len(saved) == 1 and saved[0]["balances"]["FLOP"] == "79"               # bản đi xa hơn thắng
+    refs = saved[0]["gateway_refs"]
+    assert len(refs) == tm.GATEWAY_REFS_KEEP and refs[-1] == "gNEW00000000000"     # dấu mới nhất giữ
+    assert set(full["gateway_refs"][-99:]) <= set(refs)                            # dấu cũ từ bản sao gộp vào
+    assert saved[0]["direct_refs"] == full["direct_refs"]
+
+
+def test_hydrate_keeps_local_but_adds_missing_refs(monkeypatch):
+    import token_manager as tm
+    local = _led("70", "30")
+    local["gateway_refs"] = ["gLOCAL000000000"]
+    kv = _led("90", "10")
+    kv["gateway_refs"] = ["gKV000000000000"]
+    monkeypatch.setattr(ac, "kv_get", lambda k: json.dumps(kv))
+    monkeypatch.setattr(tm, "load_ledger", lambda *a, **k: local)
+    saved = []
+    monkeypatch.setattr(tm, "save_ledger", lambda led, *a, **k: saved.append(led))
+    ac.hydrate_ledger_from_kv()
+    assert len(saved) == 1 and saved[0]["balances"]["FLOP"] == "70"               # local vẫn thắng
+    assert saved[0]["gateway_refs"] == ["gKV000000000000", "gLOCAL000000000"]
+
+
+def test_gateway_sees_todays_direct_escrow_after_cache_loss(monkeypatch):
+    """Mất Actions cache: bộ đếm escrow mua trực tiếp hôm nay chỉ còn trên KV, mà bước mua trực tiếp (nạp KV) chạy SAU
+    bước gateway. Trước bản sửa, trần CHUNG của gateway bỏ qua escrow đó (fuzz seed 30: 32.4 FLOP dưới trần 30)."""
+    import flop_direct as fd
+    import flop_gateway
+    now = 1_800_000_000
+    today = __import__("time").strftime("%Y-%m-%d", __import__("time").gmtime(now))
+    pk = _real_key()
+    sealed = ac._kv_seal(pk, fd.durable_view({"day": {"day": today, "escrow": 23.5}, "rev": 4}), ac.DIRECT_KV_KEY)
+    monkeypatch.setattr(ac, "kv_get", lambda key: sealed if key == ac.DIRECT_KV_KEY else None)
+    monkeypatch.setattr(ac, "save_state", lambda d: None)
+    monkeypatch.setenv("FLOP_GATEWAY_PROMPTS", "q")
+    monkeypatch.setenv("FLOP_MAX_SPEND_PER_DAY", "30")
+    monkeypatch.setenv("FLOP_DIRECT_ENABLED", "on")
+    monkeypatch.delenv("TESTNET_ENABLED", raising=False)
+    rooms = []
+    monkeypatch.setattr(flop_gateway, "run_step", lambda state, **k: rooms.append(k["spend_room"]()) or
+                        {"outcome": "pace_wait", "calls": 0})
+    st = {"gateway_inflight": {"day_spent": {"day": today, "spent": 6.5}, "at": now - 60}}   # cache mất, KV còn
+    ac.gateway_session_step(st, pk, now)
+    assert rooms == [pytest.approx(30 - 6.5 - 23.5)]
+    # Mua trực tiếp TẮT: không đọc KV thêm ở bước gateway (đường tắt có kiểm tra KV riêng, theo nhịp 6 giờ).
+    monkeypatch.setenv("FLOP_DIRECT_ENABLED", "off")
+    rooms.clear()
+    ac.gateway_session_step({"gateway_inflight": {"day_spent": {"day": today, "spent": 6.5}, "at": now - 60}}, pk, now)
+    assert rooms == [pytest.approx(30 - 6.5)]
