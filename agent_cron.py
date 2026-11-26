@@ -3800,7 +3800,7 @@ def _faucet_claim_fn(req: dict) -> dict:
 
 
 def _claim_http_get(url):
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=15)
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=30)      # faucet testnet quá tải: 15s hay hụt
     try:
         return r.status_code, (r.json() if r.content else None)
     except ValueError:

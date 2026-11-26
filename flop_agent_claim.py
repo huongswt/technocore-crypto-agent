@@ -34,7 +34,8 @@ WAIT_MAX = 2 * DAY                 # hẹn xa hơn 2 ngày = rác, kẹp lại
 SIG_FAIL_PAUSE = 7 * DAY
 REFUSE_MIN = 6 * 3600              # bị từ chối không kèm giờ chờ -> thử lại sau ≥ 6 giờ
 NETWORK_RETRY = 900                # lỗi mạng / 5xx -> 15 phút, GIỮ nonce (gửi lại an toàn)
-CLOSED_RETRY = 1800                # faucet đóng / hết tiền -> 30 phút
+READ_RETRY = 300                   # /chain hoặc /limits không đọc được (quá tải, 429, 5xx) -> 5 phút
+CLOSED_RETRY = 1800               # faucet đóng / hết tiền -> 30 phút
 MAX_AMOUNT = 1000.0                # làn agent cấp 10; số lớn hơn mức này là đơn vị sai -> không tin
 
 
@@ -109,8 +110,12 @@ def run_step(rec, wallet_priv, address: str, now: float, http_get, http_post):
         cs, chain = http_get(f"{base}/chain")
         ls, lim = http_get(f"{base}/limits")
     except Exception as e:
-        return done(f"error-read:{type(e).__name__}", retry=NETWORK_RETRY)
-    chain = chain if isinstance(chain, dict) else {}
+        return done(f"error-read:{type(e).__name__}", retry=READ_RETRY)    # chưa ký gì: thử lại sớm
+    if cs != 200 or not isinstance(chain, dict):
+        # Đọc lỗi tạm thời (faucet quá tải / 429 / 5xx) — KHÔNG phải đổi mạng: thử lại sớm, ghi rõ mã HTTP.
+        return done(f"chain-unreadable:{cs}", retry=READ_RETRY)
+    if ls != 200 or not isinstance(lim, dict) or not isinstance(lim.get("faucet"), dict):
+        return done(f"limits-unreadable:{ls}", retry=READ_RETRY)
     gen = str(chain.get("genesisHash") or "").lower()
     if cs != 200 or chain.get("network") != "testnet" or gen != expected_genesis():
         # Faucet đổi mạng / genesis khác -> KHÔNG ký (ký là cam kết địa chỉ cho chuỗi đó).

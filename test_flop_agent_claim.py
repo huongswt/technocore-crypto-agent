@@ -71,6 +71,19 @@ def test_closed_or_low_balance_faucet_waits_without_posting():
     assert out == "faucet-closed:low_balance" and sent == []
 
 
+def test_unreadable_chain_or_limits_retries_soon_with_http_code():
+    def g503(url):
+        return (503, None) if url.endswith("/limits") else (200, CHAIN)
+    sent = []
+    rec, out, _ = fac.run_step({}, KEY, ADDR, NOW, g503, _post([], sent))
+    assert out == "limits-unreadable:503" and sent == [] and rec["next_ts"] == int(NOW) + fac.READ_RETRY
+
+    def g429(url):
+        return (429, {"error": "slow down"}) if url.endswith("/chain") else (200, LIMITS)
+    rec, out, _ = fac.run_step({}, KEY, ADDR, NOW, g429, _post([], sent))
+    assert out == "chain-unreadable:429" and sent == [] and rec["next_ts"] == int(NOW) + fac.READ_RETRY
+
+
 def test_retry_later_keeps_the_same_nonce():
     sent = []
     busy = (503, {"success": False, "reason": "indexer_unavailable", "retryAfterSeconds": 60}, None)
