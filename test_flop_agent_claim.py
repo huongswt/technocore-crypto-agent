@@ -76,6 +76,12 @@ def test_shared_daily_cap_is_rechecked_every_5_minutes():
     lim = {"faucet": {"status": "daily_cap_reached", "agent": {"claimPath": "/v1/testnet/agent-claims"}}}
     rec, out, _ = fac.run_step({}, KEY, ADDR, NOW, _get(limits=lim), _post([], sent))
     assert out == "faucet-closed:daily_cap_reached" and sent == [] and rec["next_ts"] == int(NOW) + fac.READ_RETRY
+    partial = {"faucet": {"signer": "5Cc"}}                                  # JSON rút gọn khi quá tải
+    rec, out, _ = fac.run_step({}, KEY, ADDR, NOW, _get(limits=partial), _post([], sent))
+    assert out == "faucet-closed:None" and sent == [] and rec["next_ts"] == int(NOW) + fac.READ_RETRY
+    unk = {"faucet": {"status": "unknown"}}
+    rec, out, _ = fac.run_step({}, KEY, ADDR, NOW, _get(limits=unk), _post([], sent))
+    assert out == "faucet-closed:unknown" and sent == [] and rec["next_ts"] == int(NOW) + fac.READ_RETRY
     low = {"faucet": {"status": "low_balance", "agent": {"claimPath": "/v1/testnet/agent-claims"}}}
     rec, out, _ = fac.run_step({}, KEY, ADDR, NOW, _get(limits=low), _post([], sent))
     assert rec["next_ts"] == int(NOW) + fac.CLOSED_RETRY
