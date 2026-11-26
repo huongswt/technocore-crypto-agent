@@ -161,6 +161,26 @@ def test_absurd_amount_is_not_recorded_as_a_number():
     assert out == "claimed" and rec["claims"][-1]["amount"] is None and "nhận ? FLOP" in alert
 
 
+def test_read_retries_transient_5xx_but_not_429(monkeypatch):
+    import agent_cron as ac
+
+    class R:
+        def __init__(self, st):
+            self.status_code, self.content = st, b'{"ok": 1}'
+
+        def json(self):
+            return {"ok": 1}
+
+    seq, sleeps = [503, 502, 200], []
+    monkeypatch.setattr(ac.requests, "get", lambda *a, **k: R(seq.pop(0)))
+    monkeypatch.setattr(ac.time, "sleep", sleeps.append)
+    assert ac._claim_http_get("https://x/chain") == (200, {"ok": 1}) and sleeps == [3, 8]
+    seq, sleeps[:] = [503, 503, 503, 200], []
+    assert ac._claim_http_get("https://x/chain")[0] == 503 and len(sleeps) == 2     # tối đa 3 lần đọc
+    seq, sleeps[:] = [429, 200], []
+    assert ac._claim_http_get("https://x/chain")[0] == 429 and sleeps == []          # 429: không đọc dồn
+
+
 def test_step_is_wired_and_state_is_durable(monkeypatch):
     import agent_cron as ac
     assert "testnet_claim" in ac.DURABLE_STATE_KEYS

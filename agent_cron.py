@@ -3799,8 +3799,17 @@ def _faucet_claim_fn(req: dict) -> dict:
     return out
 
 
+_CLAIM_READ_BACKOFF = (3, 8)        # faucet testnet (Cloudflare) trả 502/503/504 ngẫu nhiên khi quá tải
+
+
 def _claim_http_get(url):
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=30)      # faucet testnet quá tải: 15s hay hụt
+    """GET /chain hoặc /limits (chỉ ĐỌC, chưa ký): gặp 502/503/504 thì đọc lại tối đa 2 lần trong lượt, cách vài giây.
+    Không áp cho POST claim và không áp cho 429 (tôn trọng giới hạn của faucet)."""
+    for pause in (*_CLAIM_READ_BACKOFF, None):
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=30)  # faucet testnet quá tải: 15s hay hụt
+        if r.status_code not in (502, 503, 504) or pause is None:
+            break
+        time.sleep(pause)
     try:
         return r.status_code, (r.json() if r.content else None)
     except ValueError:
