@@ -71,6 +71,16 @@ def test_closed_or_low_balance_faucet_waits_without_posting():
     assert out == "faucet-closed:low_balance" and sent == []
 
 
+def test_shared_daily_cap_is_rechecked_every_5_minutes():
+    sent = []
+    lim = {"faucet": {"status": "daily_cap_reached", "agent": {"claimPath": "/v1/testnet/agent-claims"}}}
+    rec, out, _ = fac.run_step({}, KEY, ADDR, NOW, _get(limits=lim), _post([], sent))
+    assert out == "faucet-closed:daily_cap_reached" and sent == [] and rec["next_ts"] == int(NOW) + fac.READ_RETRY
+    low = {"faucet": {"status": "low_balance", "agent": {"claimPath": "/v1/testnet/agent-claims"}}}
+    rec, out, _ = fac.run_step({}, KEY, ADDR, NOW, _get(limits=low), _post([], sent))
+    assert rec["next_ts"] == int(NOW) + fac.CLOSED_RETRY
+
+
 def test_unreadable_chain_or_limits_retries_soon_with_http_code():
     def g503(url):
         return (503, None) if url.endswith("/limits") else (200, CHAIN)

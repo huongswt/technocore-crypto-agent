@@ -125,7 +125,9 @@ def run_step(rec, wallet_priv, address: str, now: float, http_get, http_post):
     agent = fau.get("agent") if isinstance(fau.get("agent"), dict) else {}
     path = agent.get("claimPath")
     if ls != 200 or fau.get("status") != "open" or not isinstance(path, str) or not path.startswith("/"):
-        return done(f"faucet-closed:{fau.get('status')}", retry=CLOSED_RETRY)
+        # daily_cap_reached = quota CHUNG của faucet (cửa sổ trượt), mở lại từng phần trong ngày -> canh 5 phút.
+        quick = fau.get("status") == "daily_cap_reached" and isinstance(path, str) and path.startswith("/")
+        return done(f"faucet-closed:{fau.get('status')}", retry=READ_RETRY if quick else CLOSED_RETRY)
 
     wrapped = rec.get("variant") == "wrapped"
     for _attempt in range(2):
