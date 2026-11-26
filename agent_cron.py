@@ -3817,7 +3817,9 @@ def _claim_http_get(url):
 
 
 def _claim_http_post(url, body):
-    r = requests.post(url, json=body, headers={"User-Agent": UA, "Content-Type": "application/json"}, timeout=30)
+    # Faucet chờ giao dịch vào block rồi mới trả lời; 30s bị ReadTimeout. Hết giờ vẫn an toàn (giữ nonce, gửi lại).
+    r = requests.post(url, json=body, headers={"User-Agent": UA, "Content-Type": "application/json"},
+                      timeout=(10, 90))
     try:
         data = r.json() if r.content else None
     except ValueError:
