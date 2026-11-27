@@ -3828,6 +3828,17 @@ def _claim_http_post(url, body):
     return r.status_code, data, dict(r.headers)
 
 
+def _claim_wallet_txs(addr):
+    # Giao dịch gần đây của ví (explorer testnet): tìm khoản faucet đã chuyển dù POST trả lỗi.
+    r = requests.get(f"{_explorer_base('testnet')}/api/accounts/{addr}/transactions", params={"limit": "50"},
+                     headers={"User-Agent": UA}, timeout=15)
+    r.raise_for_status()
+    d = r.json()
+    if isinstance(d, dict):
+        d = d.get("data")
+    return d if isinstance(d, list) else []
+
+
 def testnet_claim_step(state: dict, private_key, now: float = None) -> str:
     """(GATED FLOP_FAUCET_AGENT_CLAIM) Nhận 10 FLOP testnet/ngày qua làn agent của faucet, ký bằng khoá ví (DID).
     Không ghi sổ cái; chỉ lưu lịch sử claim (bền qua KV) và báo Telegram khi nhận / khi bị từ chối lần đầu."""
@@ -3842,7 +3853,7 @@ def testnet_claim_step(state: dict, private_key, now: float = None) -> str:
             return "no-wallet"
         addr = flop_gateway.wallet_address(wk)
         rec, outcome, alert = fac.run_step(state.get(fac.KEY), wk, addr, time.time() if now is None else now,
-                                           _claim_http_get, _claim_http_post)
+                                           _claim_http_get, _claim_http_post, grants_fn=_claim_wallet_txs)
         if outcome == "wait":
             return outcome
         print(f"[claim] faucet testnet: {outcome}")
@@ -5922,6 +5933,14 @@ def direct_session_step(state: dict, private_key, now: int) -> str:
             d = r.json()
             return d.get("data") if isinstance(d, dict) and isinstance(d.get("data"), list) else []
 
+        def miner_channels(miner):
+            # Kênh gần đây của MỘT miner (mọi agent) — chấm sức khoẻ: miner còn trả tiền cho ai không.
+            r = requests.get(f"{explorer}/api/compute-channels", params={"miner": miner, "limit": "50"},
+                             headers={"User-Agent": UA}, timeout=15)
+            r.raise_for_status()
+            d = r.json()
+            return d.get("data") if isinstance(d, dict) and isinstance(d.get("data"), list) else []
+
         def own_txs(addr):
             # Giao dịch gần đây của ví (explorer): tìm expireForceOpen/timeout đã hoàn kênh lỗi mà explorer xoá (404).
             r = requests.get(f"{explorer}/api/accounts/{addr}/transactions", params={"limit": "50"},
@@ -6029,7 +6048,7 @@ def direct_session_step(state: dict, private_key, now: int) -> str:
             deadline=direct_deadline(), alert=_telegram_send, checkpoint=checkpoint,
             spend_room=lambda: combined_spend_room(state, now),
             booked_fn=(lambda cid: _tm.direct_booked(cid)) if testnet else None, nonce_fn=nonce,
-            rpc_ready_fn=rpc_ready if rpc_url else None, own_txs_fn=own_txs)
+            rpc_ready_fn=rpc_ready if rpc_url else None, own_txs_fn=own_txs, miner_channels_fn=miner_channels)
         direct_kv_persist(state, private_key)
         save_state({flop_direct.KEY: state.get(flop_direct.KEY)})
         global _DIRECT_LAST
