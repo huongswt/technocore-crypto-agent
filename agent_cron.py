@@ -1214,6 +1214,7 @@ TESTNET_RADAR = os.environ.get("FLOP_TESTNET_RADAR", "").strip().lower() not in 
 TESTNET_RADAR_H = max(0.25, _env_float("FLOP_TESTNET_RADAR_HOURS", 1))
 # Explorer thêm cho radar "đứng tên ai" (vd host explorer testnet nếu khác mặc định trong flop_radar).
 RADAR_EXPLORER = os.environ.get("FLOP_RADAR_EXPLORER_URL", "").strip().rstrip("/")
+TESTNET_EXPLORER = "https://testnet.flopscan.io"
 
 
 def _github_headers(url: str) -> dict:
@@ -4868,7 +4869,12 @@ def _explorer_base(net: str) -> str:
     """Explorer của mạng đang chạy: FLOP_RADAR_EXPLORER_URL nếu đặt, không thì theo tên mạng."""
     if RADAR_EXPLORER.startswith("https://"):
         return RADAR_EXPLORER
-    return f"https://explorer.{_explorer_net(net)}.flop.network"
+    name = _explorer_net(net)
+    if name == "testnet":
+        # Testnet công khai (24/11) dùng FLOPScan (docs.flop.network/networks/testnet); explorer.testnet.flop.network
+        # không phân giải. API cùng dạng explorer devnet (/api/compute-channels, /api/accounts, /api/stats).
+        return TESTNET_EXPLORER
+    return f"https://explorer.{name}.flop.network"
 
 
 def _first_str(d: dict, keys) -> str:
@@ -5854,7 +5860,7 @@ def direct_session_step(state: dict, private_key, now: int) -> str:
     import token_manager as _tm
     try:
         testnet = _tm.testnet_enabled()
-        network = "testnet" if testnet else "devnet"
+        network = direct_network(testnet)
         prompts = _gateway_prompts(now, "")          # mỗi phiên một đề (flop_direct xoay theo prompt_idx)
         explorer = _explorer_base(network)
         direct_kv_hydrate(state, private_key)
@@ -5916,6 +5922,16 @@ def direct_session_step(state: dict, private_key, now: int) -> str:
             d = r.json()
             return d.get("data") if isinstance(d, dict) and isinstance(d.get("data"), list) else []
 
+        def own_txs(addr):
+            # Giao dịch gần đây của ví (explorer): tìm expireForceOpen/timeout đã hoàn kênh lỗi mà explorer xoá (404).
+            r = requests.get(f"{explorer}/api/accounts/{addr}/transactions", params={"limit": "50"},
+                             headers={"User-Agent": UA}, timeout=15)
+            r.raise_for_status()
+            d = r.json()
+            if isinstance(d, dict):
+                d = d.get("data")
+            return d if isinstance(d, list) else []
+
         _prices = {}
 
         def price(model_hash):
@@ -5955,12 +5971,48 @@ def direct_session_step(state: dict, private_key, now: int) -> str:
                 return None
             r.raise_for_status()
             d = r.json()
+            if isinstance(d, dict) and d.get("liveBalance") is False:
+                return None      # FLOPScan: "balance":"0" từ cache khi không đọc được chain -> không biết, không phải 0
             raw = d.get("balance") if isinstance(d, dict) else None
             from decimal import Decimal as _D
             try:
                 return _D(int(str(raw))) / _D(10) ** 18 if raw is not None else None
             except ValueError:
                 return None
+
+        rpc_url = direct_rpc_url(network)
+
+        def rpc_call(method, params):
+            r = requests.post(rpc_url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                              headers={"User-Agent": UA, "Content-Type": "application/json"}, timeout=20)
+            r.raise_for_status()
+            d = r.json() or {}
+            if "result" not in d:
+                raise ValueError(str(d.get("error"))[:80])
+            return d["result"]
+
+        def rpc_ready():
+            # RPC đồng bộ dở/chậm -> SDK từ chối ký (báo nhầm "outcome unknown"): kiểm trước khi mở phiên.
+            return direct_rpc_not_ready(rpc_call)
+
+        def nonce(addr):
+            # Nonce TIẾP THEO của ví (system_accountNextIndex: tính cả giao dịch còn trong pool) — để gỡ sớm khoản giữ
+            # "không rõ kết quả" khi chain chứng minh không gì được gửi. Không có RPC thì explorer (chỉ khi số đọc sống).
+            if rpc_url:
+                r = requests.post(rpc_url, json={"jsonrpc": "2.0", "id": 1, "method": "system_accountNextIndex",
+                                                 "params": [addr]},
+                                  headers={"User-Agent": UA, "Content-Type": "application/json"}, timeout=15)
+                r.raise_for_status()
+                v = (r.json() or {}).get("result")
+                return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+            r = requests.get(f"{explorer}/api/accounts/{addr}", headers={"User-Agent": UA}, timeout=15)
+            if r.status_code != 200:
+                return None
+            d = r.json()
+            if not isinstance(d, dict) or d.get("liveBalance") is not True:
+                return None
+            v = d.get("nonce")
+            return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
 
         def checkpoint():
             # Trước MỖI phiên (mốc phiên đang chạy + trần ngày) và sau mỗi phiên (kênh mới): xuống state.json VÀ KV.
@@ -5976,14 +6028,15 @@ def direct_session_step(state: dict, private_key, now: int) -> str:
             deny=direct_deny_list(PROACTIVE_DENY_DIDS),
             deadline=direct_deadline(), alert=_telegram_send, checkpoint=checkpoint,
             spend_room=lambda: combined_spend_room(state, now),
-            booked_fn=(lambda cid: _tm.direct_booked(cid)) if testnet else None)
+            booked_fn=(lambda cid: _tm.direct_booked(cid)) if testnet else None, nonce_fn=nonce,
+            rpc_ready_fn=rpc_ready if rpc_url else None, own_txs_fn=own_txs)
         direct_kv_persist(state, private_key)
         save_state({flop_direct.KEY: state.get(flop_direct.KEY)})
         global _DIRECT_LAST
         _DIRECT_LAST = (r, network, explorer)
         status = (f"{r.get('outcome')}" + (f"×{r['opened']}" if r.get("opened", 0) > 1 else "")
                   + (f" +{r['booked_flop']:.4g}FLOP" if r.get("booked") else ""))
-        print(f"[direct] {status}" + ("" if testnet else " (devnet tập, không ghi sổ)")
+        print(f"[direct] {status}" + ("" if testnet else f" ({network}, không ghi sổ)")
               + (f" — {str(r['reason'])[:160]}" if r.get("reason") else ""))
         return status
     except Exception as e:
@@ -6032,6 +6085,31 @@ _RUN_STARTED = None                  # main() đặt; ngoài main (thư viện/t
 def _mempool_blocked() -> bool:
     import token_manager
     return token_manager.testnet_enabled() and not MEMPOOL_TESTNET_ALLOWED
+
+
+def direct_rpc_not_ready(call) -> str:
+    """'' nếu RPC mua trực tiếp đủ mới để SDK ký lệnh chi, ngược lại là lý do (flop_direct.rpc_not_ready_reason)."""
+    import flop_direct
+    return flop_direct.rpc_not_ready_reason(call, lambda: time.time() * 1000)
+
+
+def direct_rpc_url(network: str) -> str:
+    """RPC HTTP của mạng mua trực tiếp (đọc nonce ví). FLOP_DIRECT_RPC_URL (https) nếu đặt; testnet công khai mặc định
+    https://testnet.flop.network/ (docs.flop.network/networks/testnet); mạng khác '' (dùng explorer)."""
+    v = os.environ.get("FLOP_DIRECT_RPC_URL", "").strip()
+    if v.startswith("https://"):
+        return v
+    return "https://testnet.flop.network/" if network == "testnet" else ""
+
+
+def direct_network(testnet: bool) -> str:
+    """Mạng của bước MUA TRỰC TIẾP. Mặc định theo TESTNET_ENABLED (testnet | devnet). FLOP_DIRECT_NETWORK=testnet cho mua
+    trực tiếp chạy trên testnet mà KHÔNG bật cả chế độ testnet (sổ, gateway, faucet /fund…): kênh vẫn đứng tên ví agent
+    trên chain, chỉ là không ghi sổ cục bộ (book_fn chỉ có khi TESTNET_ENABLED). Giá trị lạ -> bỏ qua."""
+    v = os.environ.get("FLOP_DIRECT_NETWORK", "").strip().lower()
+    if v in ("testnet", "devnet"):
+        return v
+    return "testnet" if testnet else "devnet"
 
 
 def direct_deadline() -> float:
