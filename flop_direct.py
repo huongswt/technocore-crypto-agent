@@ -46,8 +46,10 @@ KEY = "flop_direct"
 # 1014039 và có `session run --max-duration`. v0.1.505 (releases.json lúc đó) chỉ có CLI 0.9.1: không có --max-duration, kênh
 # mặc định 120 block -> settle hỏng (AttestationStale, flop-labs/network#1338) nên bị bỏ qua. Các tham số agent dùng
 # (keys import --secret-env/--out/--password-env/--type, --output agent, session run, channel finalize) vẫn còn.
-DEFAULT_IMAGE = ("ghcr.io/flop-labs/flop-core/cli:v0.1.514"
-                 "@sha256:e14e2208df0754957d6732894bf3e7ed79c24d6729e9723813bb5b60ac397318")
+# v0.1.523 (build 2026-11-27 02:08Z, revision b12ab55a) mang CLI 0.10.3: Flop Labs 28/11 "Use the latest command line
+# tool, older versions get refused by the chain". Job `cli-image` trong CI kéo đúng digest này và in phiên bản CLI.
+DEFAULT_IMAGE = ("ghcr.io/flop-labs/flop-core/cli:v0.1.523"
+                 "@sha256:d5f57fc65786baa877d16964b648a4cd69ce1158315ec88fb22a3715d91513aa")
 # ESCROW LÀ CHI PHÍ: SDK (compute-channel/session-estimate) ghi "A cooperative spot settle pays the whole escrow
 # to the miner (D-0403), so the escrow is the cost, not a ceiling". Không đặt FLOP_DIRECT_MAX_FLOP -> escrow =
 # minEscrow của offer miner công bố (mức thấp nhất miner nhận), kẹp dưới FLOP_DIRECT_ESCROW_CAP.
@@ -95,6 +97,9 @@ STALE_PROBE_SEC = 3 * 3600
 # 3 giờ vẫn coi là "ok" tới 22:09Z. Kênh còn mở (LOCKED) chỉ tính là "không PAID" khi đã quá HEALTH_LOCKED_SEC.
 HEALTH_DEGRADED_N = 3
 HEALTH_LOCKED_SEC = 30 * 60
+# Luân phiên các miner "đang trả" có KẾT CỤC GẦN NHẤT (kênh của bất kỳ agent nào) là PAID và ví mình không đang
+# lỗi liên tiếp với miner đó: miner lâu chưa dùng nhất trước. Trước đây chỉ luân phiên miner có PAID trong 1 giờ ->
+# miner khoẻ nhưng tạm ít khách (28/11: 5EfSPZVx, 5DZg2SeJ) bị loại, mọi phiên lại dồn vào một miner.
 # CLI từ chối RÕ RÀNG vì không tới được RPC chain (vd. "RPC unreachable: connection to wss://... timed out"): lỗi của
 # mạng chung, không phải của miner -> nghỉ CHUNG ngắn rồi thử lại, không chặn miner 1 giờ. Testnet 27/11: RPC quá tải
 # (trả lời 4-10 s, sát ngưỡng 10 s của CLI) khiến cả 2 miner bị chặn 1 giờ mỗi lần chập chờn.
@@ -691,7 +696,7 @@ def pace_limit(cfg: dict, now: int, salt: str = "") -> tuple[float, bool]:
 _DURABLE_TOP = ("day", "unknown_until", "wait_until", "wait_why", "prompt_idx", "miner_idx", "gnpt", "stats",
                 "last_attempt", "orphan_since", "orphan_last", "done", "unknown_escrow", "attempt", "rev")
 _DURABLE_MINER = ("unknown_until", "wait_until", "wait_why", "cap", "sessions", "unknown_nonce", "unknown_since",
-                  "unknown_escrow", "unknown_day", "fail_streak", "probe_at")
+                  "unknown_escrow", "unknown_day", "fail_streak", "probe_at", "last_used")
 _PENDING_CORE = ("channel", "ts", "network", "miner", "error", "alerted", "force", "fin_tries", "fin_at", "fin_tx",
                  "fin_alerted", "max_flop", "rec_at", "rec_tries", "rec_tx", "hold")
 _PENDING_LEARN = ("model", "model_hash", "ptok", "completion_tokens")
@@ -935,6 +940,29 @@ def miner_health(rows, now: int) -> tuple:
     if len(tail) >= HEALTH_DEGRADED_N and not any(ok for _, ok in tail):
         return "stale", len(recent), last_paid      # đang hỏng: chỉ thăm dò, dùng lại ngay khi PAID cho ai đó
     return ("ok" if recent else "stale"), len(recent), last_paid
+
+
+def latest_outcome_paid(rows, now: int):
+    """Kết cục của kênh GẦN NHẤT đã có kết cục của một miner (mọi agent): True = PAID, False = hoàn tiền hoặc còn khoá
+    quá HEALTH_LOCKED_SEC, None = chưa có kênh nào có kết cục."""
+    best = None
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        try:
+            t = int(r.get("openedAt")) // 1000
+        except (TypeError, ValueError):
+            continue
+        pay = str(r.get("paymentStatus") or "").upper()
+        if pay == "PAID":
+            ok = True
+        elif pay == "REFUNDED" or now - t > HEALTH_LOCKED_SEC:
+            ok = False
+        else:
+            continue
+        if best is None or t > best[0]:
+            best = (t, ok)
+    return None if best is None else best[1]
 
 
 def _health_on() -> bool:
@@ -1522,13 +1550,14 @@ def run_step(state: dict, *, agent_key, now: int, network: str, fetch_channel, p
         k = _mkey(m["miner"])
         if k not in _health:
             if miner_channels_fn is None or not _health_on():
-                _health[k] = ("unknown", 0, None)
+                _health[k] = ("unknown", 0, None, None)
             else:
                 try:
-                    _health[k] = miner_health(miner_channels_fn(m["miner"]), now)
+                    rows = miner_channels_fn(m["miner"])
+                    _health[k] = miner_health(rows, now) + (latest_outcome_paid(rows, now),)
                 except Exception as e:
                     log(f"[direct] đọc kênh của miner {m['miner'][:8]}… lỗi ({type(e).__name__}) — không chấm sức khoẻ")
-                    _health[k] = ("unknown", 0, None)
+                    _health[k] = ("unknown", 0, None, None)
         return _health[k]
 
     def blocked(m):
@@ -1603,6 +1632,17 @@ def run_step(state: dict, *, agent_key, now: int, network: str, fetch_channel, p
     last = ("idle", "")                                               # (kết quả, lý do) của lần thử cuối
     start = int(g.get("miner_idx") or 0)
     tried = 0
+    # Chưa tới hạn mức (nhịp rải đều / trần ngày) thì không phiên nào mở được: dừng NGAY, trước khi đọc explorer chấm sức
+    # khoẻ từng miner. Trước đây lượt "paced" (phần lớn các lượt) vẫn đọc kênh của mọi miner (7 miner x tới 3 lần thử khi
+    # explorer 503) chỉ để rồi dừng ở chốt hạn mức. Ngưỡng khớp đúng chốt trong vòng lặp: escrow cố định (đường force có
+    # FLOP_DIRECT_MAX_FLOP) cần đủ cả phiên; escrow theo offer cần ít nhất `chunk` khi đang rải đều.
+    if cfg["per_day"] > 0:
+        fixed = cfg.get("max_flop") is not None and cfg.get("via") != "offer"
+        need = float(cfg["max_flop"]) if fixed else (chunk if paced else 0.0)
+        room = float(limit) - float(ds["escrow"])
+        if room <= 0 or room + 1e-9 < need:
+            return done(cap_kind, reason=cap_reason())
+
     # Thứ tự thử: xoay vòng như cũ, rồi xếp ỔN ĐỊNH theo sức khoẻ — đang trả > chưa rõ/mới > ngừng trả; trong nhóm "đang
     # trả", miner có kênh PAID GẦN NHẤT đứng trước. Xếp theo SỐ kênh PAID trong 3 giờ (trước đây) để miner chạy nhiều mà
     # vừa hỏng đứng đầu suốt 3 giờ (27/11: 5FJ34C7r 21 PAID, chết từ 17:30Z, vẫn được thử trước 5FZAzdnV đang trả đều);
@@ -1611,7 +1651,13 @@ def run_step(state: dict, *, agent_key, now: int, network: str, fetch_channel, p
     rr = [miners[(start + j) % len(miners)] for j in range(len(miners))]
     if len(rr) > 1 and miner_channels_fn is not None and _health_on():
         _rank = {"ok": 0, "unknown": 1, "new": 1, "stale": 2}
-        rr.sort(key=lambda m: (_rank.get(health(m)[0], 1), -(health(m)[2] or 0), -health(m)[1]))
+        def _order(m):
+            h = health(m)
+            st_m = mstate(m)
+            if h[0] == "ok" and h[3] is True and not int(st_m.get("fail_streak") or 0):
+                return (0, 0, int(st_m.get("last_used") or 0), 0)       # khoẻ: lần lượt, lâu chưa dùng trước
+            return (_rank.get(h[0], 1), 1, -(h[2] or 0), -h[1])
+        rr.sort(key=_order)
     dirty = False                                                     # có kết quả phiên chưa lưu xuống đĩa
 
     def save():
@@ -1840,6 +1886,7 @@ def run_step(state: dict, *, agent_key, now: int, network: str, fetch_channel, p
             ds = {"day": day, "escrow": round(float(ds["escrow"]) + per_session, 9)}
             g["day"] = ds
             g["last_attempt"] = now
+            st["last_used"] = now
             if bal["avail"] is not None:
                 bal["avail"] -= Decimal(max_flop)
             # Mốc "phiên đang chạy" + trần ngày đã giữ XUỐNG ĐĨA trước khi CLI có thể khoá escrow on-chain.
